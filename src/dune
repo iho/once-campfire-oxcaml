@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name campfire-oxcaml)
+ (libraries base cohttp-eio eio_main sqlite3 yojson))

@@ -1,0 +1,27 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install system prerequisites
+        run: |
+          apt-get update
+          apt-get install -y autoconf build-essential ca-certificates git libsqlite3-dev libssl-dev opam pkg-config rsync
+      - name: Install OxCaml
+        run: |
+          opam init --disable-sandboxing --bare --yes
+          opam switch create 5.2.0+ox --empty --repos ox=git+https://github.com/oxcaml/opam-repository.git#3416edee6b2416f5752ce101e3f7a1933e570a32,default
+          opam repository add --switch=5.2.0+ox default https://opam.ocaml.org
+          opam install --switch=5.2.0+ox --yes ocaml-variants.5.2.0+ox
+          opam install --switch=5.2.0+ox --yes ./once_campfire_oxcaml.opam --deps-only
+      - name: Build
+        run: opam exec --switch=5.2.0+ox -- dune build --profile=release

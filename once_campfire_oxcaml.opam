@@ -1,0 +1,21 @@
+opam-version: "2.0"
+name: "once_campfire_oxcaml"
+version: "0.1.0"
+synopsis: "ONCE Campfire implemented in OxCaml"
+maintainer: "Ihor"
+authors: ["Ihor"]
+license: "MIT"
+homepage: "https://github.com/iho/once-campfire-oxcaml"
+bug-reports: "https://github.com/iho/once-campfire-oxcaml/issues"
+build: [["dune" "build" "-p" name "-j" jobs]]
+depends: [
+  "ocaml-variants" {= "5.2.0+ox"}
+  "dune" {>= "3.17"}
+  "base"
+  "cohttp-eio" {>= "6.3.0"}
+  "eio"
+  "eio_main"
+  "sqlite3"
+  "uring" {= "2.7.0" & os = "linux"}
+  "yojson"
+]
