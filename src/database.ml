@@ -48,6 +48,19 @@ let with_statement db sql f =
     ~finally:(fun () -> ignore (Sqlite3.finalize statement))
     (fun () -> f statement)
 
+let generate_join_code () =
+  let alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" in
+  let output = Buffer.create 12 in
+  while Buffer.length output < 12 do
+    Rails_crypto.random_bytes 16
+    |> String.iter (fun character ->
+           let value = Char.code character in
+           if value < 248 && Buffer.length output < 12 then
+             Buffer.add_char output alphabet.[value mod String.length alphabet])
+  done;
+  let code = Buffer.contents output in
+  String.sub code 0 4 ^ "-" ^ String.sub code 4 4 ^ "-" ^ String.sub code 8 4
+
 let create_first_run database ~name ~email_address ~password_digest ~timestamp =
   Option.bind database (fun db ->
       let run sql =
@@ -79,7 +92,7 @@ let create_first_run database ~name ~email_address ~password_digest ~timestamp =
           "INSERT INTO accounts(name,join_code,created_at,updated_at) VALUES(?,?,?,?)"
           (fun statement ->
             bind statement
-              [ "Campfire"; Rails_crypto.base64url_encode (Rails_crypto.random_bytes 9);
+              [ "Campfire"; generate_join_code ();
                 timestamp; timestamp ]);
         with_statement db
           "INSERT INTO users(name,email_address,password_digest,role,status,created_at,updated_at) VALUES(?,?,?,1,0,?,?)"
@@ -217,7 +230,7 @@ let messages_for_room database room_id =
   Option.fold ~none:[]
     ~some:(fun db ->
       with_statement db
-        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='content' WHERE m.room_id=? ORDER BY m.created_at,m.id"
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=? ORDER BY m.created_at DESC,m.id DESC LIMIT 40"
         (fun statement ->
           check_rc db "bind message room" (Sqlite3.bind_int statement 1 room_id);
           let rec collect messages =
@@ -235,7 +248,7 @@ let messages_for_room database room_id =
                   (Printf.sprintf "message lookup failed (%s): %s"
                      (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
           in
-          collect []))
+          collect [] |> List.rev))
     database
 
 let create_message database ~room_id ~creator_id ~body ~client_message_id ~timestamp =
@@ -291,7 +304,7 @@ let create_message database ~room_id ~creator_id ~body ~client_message_id ~times
               | _ -> failwith "message insert returned no row")
         in
         with_statement db
-          "INSERT INTO action_text_rich_texts(record_type,record_id,name,body,created_at,updated_at) VALUES('Message',?,'content',?,?,?)"
+          "INSERT INTO action_text_rich_texts(record_type,record_id,name,body,created_at,updated_at) VALUES('Message',?,'body',?,?,?)"
           (fun statement ->
             check_rc db "bind rich text message id"
               (Sqlite3.bind_int statement 1 message_id);

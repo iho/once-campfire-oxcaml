@@ -106,6 +106,11 @@ let () =
         (Database.with_statement setup_db "SELECT name FROM accounts" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_text statement 0));
+      check "first-run Rails join code format" true
+        (Database.with_statement setup_db "SELECT join_code FROM accounts" (fun statement ->
+             ignore (Sqlite3.step statement);
+             let code = Sqlite3.column_text statement 0 in
+             String.length code = 14 && code.[4] = '-' && code.[9] = '-'));
       check "first-run creates All Talk open room" "Rooms::Open:All Talk"
         (Database.with_statement setup_db "SELECT type||':'||name FROM rooms" (fun statement ->
              ignore (Sqlite3.step statement);
