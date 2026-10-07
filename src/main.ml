@@ -274,7 +274,14 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ "</ul></nav><main><h1>"
   ^ html_escape current.Database.name
   ^ "</h1><p><a href=\"/rooms/" ^ string_of_int current.Database.id
-  ^ "/involvement\">Notification preferences</a></p><section aria-label=\"Messages\"><ol>"
+  ^ "/involvement\">Notification preferences</a>"
+  ^ (if current.Database.kind = "Rooms::Direct" then ""
+     else if current.Database.creator_id = user.Database.id || user.Database.role = 1 then
+       let kind = if current.Database.kind = "Rooms::Open" then "opens" else "closeds" in
+       " · <a href=\"/rooms/" ^ kind ^ "/" ^ string_of_int current.Database.id
+       ^ "/edit\">Edit room</a>"
+     else "")
+  ^ "</p><section aria-label=\"Messages\"><ol>"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
            let actions =
@@ -325,6 +332,14 @@ let room_message_collection_id path =
 let room_involvement_id path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; id; "involvement" ] -> int_of_string_opt id
+  | _ -> None
+
+let room_editor_route_of_path path suffix =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; (("opens" | "closeds") as kind); id ]
+    when suffix = "" -> Option.map (fun id -> (kind, id)) (int_of_string_opt id)
+  | [ ""; "rooms"; (("opens" | "closeds") as kind); id; "edit" ]
+    when suffix = "edit" -> Option.map (fun id -> (kind, id)) (int_of_string_opt id)
   | _ -> None
 
 let room_at_message path =
@@ -977,6 +992,99 @@ let room_response database secret headers room_id messages ~older_messages
                room session.Session.csrf_form_token messages ~older_messages
                ~newer_messages))
 
+let edit_room_page database secret headers room_id =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      (match Database.find_room_for_user database identity.Database.user.id room_id with
+      | None -> response `Not_found "Room not found or inaccessible"
+      | Some room when room.Database.kind = "Rooms::Direct" ->
+          response `Not_found "Room not found or inaccessible"
+      | Some room
+        when not
+               (Database.can_administer_room database ~room_id
+                  ~user_id:identity.Database.user.id ~role:identity.Database.user.role) ->
+          response `Forbidden "Room administration is not allowed"
+      | Some room ->
+          let session = load_session secret headers in
+          let member_ids = Database.room_member_ids database room_id in
+          let users =
+            Database.active_users database
+            |> List.map (fun (user : Database.user_option) ->
+                   let selected =
+                     room.Database.kind = "Rooms::Open"
+                     || List.mem user.Database.id member_ids
+                   in
+                   let checked = if selected then " checked" else "" in
+                   "<li><label><input type=\"checkbox\" name=\"user_ids[]\" value=\""
+                   ^ string_of_int user.Database.id ^ "\"" ^ checked ^ ">"
+                   ^ html_escape user.Database.name ^ "</label></li>")
+            |> String.concat ""
+          in
+          let selected_type =
+            if room.Database.kind = "Rooms::Open" then "Rooms::Open" else "Rooms::Closed"
+          in
+          let open_selected = if selected_type = "Rooms::Open" then " selected" else "" in
+          let closed_selected = if selected_type = "Rooms::Closed" then " selected" else "" in
+          let kind = if room.Database.kind = "Rooms::Open" then "opens" else "closeds" in
+          html_with_session ~secret session `OK
+            ("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+            ^ html_escape session.Session.csrf_form_token
+            ^ "\"><title>Edit room · Campfire</title></head><body><main><a href=\"/rooms/"
+            ^ string_of_int room_id ^ "\">Back to room</a><h1>Edit room</h1><form action=\"/rooms/"
+            ^ kind ^ "/" ^ string_of_int room_id
+            ^ "\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+            ^ html_escape session.Session.csrf_form_token
+            ^ "\"><label>Room name<input name=\"room[name]\" required value=\""
+            ^ html_escape room.Database.name
+            ^ "\"></label><label>Access<select name=\"room[type]\"><option value=\"Rooms::Open\""
+            ^ open_selected
+            ^ ">Everyone</option><option value=\"Rooms::Closed\"" ^ closed_selected
+            ^ ">Selected people</option></select></label><fieldset><legend>People with access (used for private rooms)</legend><ul>"
+            ^ users
+            ^ "</ul></fieldset><button type=\"submit\">Save room</button></form></main></body></html>"))
+
+let update_room_request database secret headers path room_id body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"PATCH" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (match Database.find_room_for_user database identity.Database.user.id room_id with
+        | None -> response `Not_found "Room not found or inaccessible"
+        | Some room when room.Database.kind = "Rooms::Direct" ->
+            response `Not_found "Room not found or inaccessible"
+        | Some _
+          when not
+                 (Database.can_administer_room database ~room_id
+                    ~user_id:identity.Database.user.id ~role:identity.Database.user.role) ->
+            response `Forbidden "Room administration is not allowed"
+        | Some _ ->
+            let name = namespaced_form_value form "room" "name" in
+            let kind = namespaced_form_value form "room" "type" in
+            let member_ids =
+              parse_form_pairs body
+              |> List.filter_map (fun (key, value) ->
+                     if key = "user_ids[]" then int_of_string_opt value else None)
+            in
+            if
+              Database.update_shared_room database ~room_id
+                ~user_id:identity.Database.user.id ~role:identity.Database.user.role
+                ~name ~kind ~member_ids ~timestamp:(timestamp_now ())
+            then redirect ("/rooms/" ^ string_of_int room_id)
+            else response `Unprocessable_entity "Room could not be saved")
+
 let involvement_page database secret headers room_id =
   match current_identity database secret headers with
   | None -> redirect "/session/new"
@@ -1101,6 +1209,35 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
           | Request_body_too_large ->
               response `Request_entity_too_large "Request body too large"
           | _ -> response `Bad_request "Invalid notification preference request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | `GET, room_edit_path when room_editor_route_of_path room_edit_path "edit" <> None ->
+      (match (secret_key_base (), room_editor_route_of_path room_edit_path "edit") with
+      | Some secret, Some (_, room_id) -> edit_room_page database secret headers room_id
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | (`POST | `PATCH), room_update_path
+    when room_editor_route_of_path room_update_path "" <> None ->
+      (match (secret_key_base (), room_editor_route_of_path room_update_path "") with
+      | Some secret, Some (kind, room_id) ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `PATCH -> "PATCH"
+               | `POST ->
+                   parse_form body |> fun form -> form_value form "_method"
+                   |> String.uppercase_ascii
+               | _ -> ""
+             in
+             if method_ <> "PATCH" then response `Method_not_allowed "Method not allowed"
+             else
+               update_room_request database secret headers
+                 ("/rooms/" ^ kind ^ "/" ^ string_of_int room_id) room_id body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid room update request")
       | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | _, None -> response `Not_found "Not found")
   | `GET, "/rooms/opens/new" ->

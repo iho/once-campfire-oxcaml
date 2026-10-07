@@ -257,6 +257,39 @@ let () =
                | error -> failwith (Sqlite3.Rc.to_string error)
              in
              collect []));
+      check "room creator can administer shared room" true
+        (Database.can_administer_room (Some setup_db) ~room_id:open_room_id
+           ~user_id ~role:0);
+      check "ordinary member cannot administer shared room" false
+        (Database.can_administer_room (Some setup_db) ~room_id:open_room_id
+           ~user_id:(user_id + 1) ~role:0);
+      check "ordinary member cannot rename or convert shared room" false
+        (Database.update_shared_room (Some setup_db) ~room_id:open_room_id
+           ~user_id:(user_id + 1) ~role:0 ~name:"forged"
+           ~kind:"Rooms::Closed" ~member_ids:[ user_id + 1 ]
+           ~timestamp:"2026-10-07 12:03:10.000");
+      check "open room converts to private and revokes unselected users" true
+        (Database.update_shared_room (Some setup_db) ~room_id:open_room_id
+           ~user_id ~role:1 ~name:"Private planning"
+           ~kind:"Rooms::Closed" ~member_ids:[ user_id ]
+           ~timestamp:"2026-10-07 12:03:15.000");
+      check "private conversion retains only selected users" [ user_id ]
+        (Database.room_member_ids (Some setup_db) open_room_id);
+      check "private room converts to public and grants all active users" true
+        (Database.update_shared_room (Some setup_db) ~room_id:open_room_id
+           ~user_id ~role:1 ~name:"Planning"
+           ~kind:"Rooms::Open" ~member_ids:[]
+           ~timestamp:"2026-10-07 12:03:20.000");
+      check "public conversion restores all active memberships" [ 1; 2 ]
+        (Database.room_member_ids (Some setup_db) open_room_id);
+      exec setup_db
+        "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES('Direct test','Rooms::Direct',1,'2026-10-07','2026-10-07')";
+      exec setup_db
+        "INSERT INTO memberships(room_id,user_id,created_at,updated_at) SELECT id,1,'2026-10-07','2026-10-07' FROM rooms WHERE name='Direct test'";
+      check "direct room history cannot be promoted to shared" false
+        (Database.update_shared_room (Some setup_db) ~room_id:3 ~user_id ~role:1
+           ~name:"Exposed history" ~kind:"Rooms::Open" ~member_ids:[]
+           ~timestamp:"2026-10-07 12:03:25.000");
       let closed_room_id =
         Database.create_closed_room (Some setup_db) ~name:"Private planning"
           ~creator_id:user_id ~member_ids:[ user_id + 1; user_id + 1; 999 ]
@@ -292,7 +325,7 @@ let () =
               ~creator_id:(user_id + 2) ~timestamp:"2026-10-07 12:04:00.000");
          failwith "inactive room creator unexpectedly succeeded"
        with Failure message when message = "active room creator required" -> ());
-      check "failed open-room creation is rolled back" 3
+      check "failed open-room creation is rolled back" 4
         (Database.with_statement setup_db "SELECT count(*) FROM rooms" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));

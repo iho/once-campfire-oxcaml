@@ -8,7 +8,7 @@ type user = {
 }
 
 type identity = { session_id : int; user : user }
-type room = { id : int; name : string; kind : string }
+type room = { id : int; name : string; kind : string; creator_id : int }
 type user_option = { id : int; name : string }
 type message = {
   id : int;
@@ -299,7 +299,7 @@ let rooms_for_user database user_id =
   Option.fold ~none:[]
     ~some:(fun db ->
       with_statement db
-        "SELECT r.id,COALESCE(r.name,''),r.type FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY r.created_at,r.id"
+        "SELECT r.id,COALESCE(r.name,''),r.type,r.creator_id FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY r.created_at,r.id"
         (fun statement ->
           check_rc db "bind room membership user"
             (Sqlite3.bind_int statement 1 user_id);
@@ -309,7 +309,8 @@ let rooms_for_user database user_id =
                 collect
                   ({ id = Sqlite3.column_int statement 0;
                      name = Sqlite3.column_text statement 1;
-                     kind = Sqlite3.column_text statement 2 }
+                     kind = Sqlite3.column_text statement 2;
+                     creator_id = Sqlite3.column_int statement 3 }
                   :: rooms)
             | Sqlite3.Rc.DONE -> List.rev rooms
             | error ->
@@ -323,6 +324,24 @@ let rooms_for_user database user_id =
 let find_room_for_user database user_id room_id =
   rooms_for_user database user_id
   |> List.find_opt (fun (room : room) -> room.id = room_id)
+
+let room_member_ids database room_id =
+  Option.fold ~none:[] ~some:(fun db ->
+      with_statement db
+        "SELECT user_id FROM memberships WHERE room_id=? ORDER BY user_id"
+        (fun statement ->
+          check_rc db "bind room member list" (Sqlite3.bind_int statement 1 room_id);
+          let rec collect ids =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW -> collect (Sqlite3.column_int statement 0 :: ids)
+            | Sqlite3.Rc.DONE -> List.rev ids
+            | error ->
+                failwith
+                  (Printf.sprintf "room members lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
 
 let membership_involvement database ~room_id ~user_id =
   Option.bind database (fun db ->
@@ -522,6 +541,153 @@ let create_closed_room database ~name ~creator_id ~member_ids ~timestamp =
       with error ->
         (try run "ROLLBACK" with _ -> ());
         raise error)
+
+let can_administer_room database ~room_id ~user_id ~role =
+  role = 1
+  || Option.fold ~none:false
+       ~some:(fun db ->
+         with_statement db
+           "SELECT 1 FROM rooms r JOIN memberships m ON m.room_id=r.id AND m.user_id=? WHERE r.id=? AND r.creator_id=? AND r.type<>'Rooms::Direct' LIMIT 1"
+           (fun statement ->
+             check_rc db "bind room admin user" (Sqlite3.bind_int statement 1 user_id);
+             check_rc db "bind room admin id" (Sqlite3.bind_int statement 2 room_id);
+             check_rc db "bind room creator" (Sqlite3.bind_int statement 3 user_id);
+             match Sqlite3.step statement with
+             | Sqlite3.Rc.ROW -> true
+             | Sqlite3.Rc.DONE -> false
+             | error ->
+                 failwith
+                   (Printf.sprintf "room authorization lookup failed (%s): %s"
+                      (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+       database
+
+let update_shared_room database ~room_id ~user_id ~role ~name ~kind ~member_ids
+    ~timestamp =
+  let kind =
+    match kind with
+    | "Rooms::Open" | "Rooms::Closed" -> Some kind
+    | _ -> None
+  in
+  match (kind, database) with
+  | None, _ | _, None -> false
+  | Some kind, Some db ->
+      if String.trim name = ""
+         || not (exists db
+                   (Printf.sprintf "SELECT 1 FROM memberships WHERE room_id=%d AND user_id=%d LIMIT 1"
+                      room_id user_id))
+         || not (can_administer_room database ~room_id ~user_id ~role)
+      then false
+      else
+        let run sql =
+          match Sqlite3.exec db sql with
+          | Sqlite3.Rc.OK -> ()
+          | error ->
+              failwith
+                (Printf.sprintf "room update transaction failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+        in
+        run "BEGIN IMMEDIATE";
+        try
+          let exists_shared =
+            exists db
+              (Printf.sprintf
+                 "SELECT 1 FROM rooms WHERE id=%d AND type<>'Rooms::Direct' LIMIT 1"
+                 room_id)
+          in
+          if not exists_shared then (run "ROLLBACK"; false)
+          else (
+            with_statement db
+              "UPDATE rooms SET name=?,type=?,updated_at=? WHERE id=? AND type<>'Rooms::Direct'"
+              (fun statement ->
+                List.iteri
+                  (fun index value ->
+                    check_rc db "bind room update value"
+                      (Sqlite3.bind_text statement (index + 1) value))
+                  [ String.trim name; kind; timestamp ];
+                check_rc db "bind room update id" (Sqlite3.bind_int statement 4 room_id);
+                match Sqlite3.step statement with
+                | Sqlite3.Rc.DONE -> ()
+                | error ->
+                    failwith
+                      (Printf.sprintf "room update failed (%s): %s"
+                         (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+            if kind = "Rooms::Open" then
+              with_statement db
+                "INSERT INTO memberships(room_id,user_id,created_at,updated_at) SELECT ?,id,?,? FROM users WHERE status=0 ON CONFLICT(room_id,user_id) DO NOTHING"
+                (fun statement ->
+                  check_rc db "bind public-room conversion id"
+                    (Sqlite3.bind_int statement 1 room_id);
+                  check_rc db "bind public-room conversion created_at"
+                    (Sqlite3.bind_text statement 2 timestamp);
+                  check_rc db "bind public-room conversion updated_at"
+                    (Sqlite3.bind_text statement 3 timestamp);
+                  match Sqlite3.step statement with
+                  | Sqlite3.Rc.DONE -> ()
+                  | error ->
+                      failwith
+                        (Printf.sprintf "public-room grants failed (%s): %s"
+                           (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)))
+            else (
+              List.sort_uniq compare member_ids
+              |> List.iter (fun selected_user_id ->
+                     with_statement db
+                       "INSERT INTO memberships(room_id,user_id,created_at,updated_at) SELECT ?,id,?,? FROM users WHERE id=? ON CONFLICT(room_id,user_id) DO NOTHING"
+                       (fun statement ->
+                         check_rc db "bind selected-room id"
+                           (Sqlite3.bind_int statement 1 room_id);
+                         check_rc db "bind selected-room created_at"
+                           (Sqlite3.bind_text statement 2 timestamp);
+                         check_rc db "bind selected-room updated_at"
+                           (Sqlite3.bind_text statement 3 timestamp);
+                         check_rc db "bind selected user"
+                           (Sqlite3.bind_int statement 4 selected_user_id);
+                         match Sqlite3.step statement with
+                         | Sqlite3.Rc.DONE -> ()
+                         | error ->
+                             failwith
+                               (Printf.sprintf "selected-room grant failed (%s): %s"
+                                  (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))));
+              let removed =
+                with_statement db
+                  "SELECT user_id FROM memberships WHERE room_id=?"
+                  (fun statement ->
+                    check_rc db "bind room membership list"
+                      (Sqlite3.bind_int statement 1 room_id);
+                    let rec collect users =
+                      match Sqlite3.step statement with
+                      | Sqlite3.Rc.ROW ->
+                          collect (Sqlite3.column_int statement 0 :: users)
+                      | Sqlite3.Rc.DONE ->
+                          List.filter
+                            (fun existing -> not (List.mem existing member_ids))
+                            users
+                      | error ->
+                          failwith
+                            (Printf.sprintf "room membership list failed (%s): %s"
+                               (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+                    in
+                    collect [])
+              in
+              List.iter (fun removed_user_id ->
+                  with_statement db
+                    "DELETE FROM memberships WHERE room_id=? AND user_id=?"
+                    (fun statement ->
+                      check_rc db "bind room membership revoke"
+                        (Sqlite3.bind_int statement 1 room_id);
+                      check_rc db "bind membership revoke user"
+                        (Sqlite3.bind_int statement 2 removed_user_id);
+                      match Sqlite3.step statement with
+                      | Sqlite3.Rc.DONE -> ()
+                      | error ->
+                          failwith
+                            (Printf.sprintf "room membership revoke failed (%s): %s"
+                               (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+                removed);
+            run "COMMIT";
+            true)
+        with error ->
+          (try run "ROLLBACK" with _ -> ());
+          raise error
 
 let messages_for_room ?before ?after ?around database room_id =
   Option.fold ~none:[]

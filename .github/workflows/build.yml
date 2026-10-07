@@ -12,9 +12,18 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     container: debian:trixie-slim
+    env:
+      OPAMROOT: ${{ github.workspace }}/.opam-root
     steps:
       - uses: actions/checkout@v4
         # The Rails reference submodule is not needed by the OxCaml build or tests.
+      - name: Cache OxCaml toolchain
+        uses: actions/cache@v4
+        with:
+          path: .opam-root
+          key: opam-${{ runner.os }}-debian-trixie-5.2.0+ox-${{ hashFiles('once_campfire_oxcaml.opam') }}-3416edee6b2416f5752ce101e3f7a1933e570a32
+          restore-keys: |
+            opam-${{ runner.os }}-debian-trixie-5.2.0+ox-
       - name: Install system prerequisites
         run: |
           apt-get update
@@ -22,8 +31,12 @@ jobs:
       - name: Install OxCaml
         run: |
           opam init --disable-sandboxing --bare --yes
-          opam switch create 5.2.0+ox --empty --repos ox=git+https://github.com/oxcaml/opam-repository.git#3416edee6b2416f5752ce101e3f7a1933e570a32,default
-          opam repository add --switch=5.2.0+ox default https://opam.ocaml.org
+          if ! opam switch list --short | grep -Fxq 5.2.0+ox; then
+            opam switch create 5.2.0+ox --empty --repos ox=git+https://github.com/oxcaml/opam-repository.git#3416edee6b2416f5752ce101e3f7a1933e570a32,default
+          fi
+          if ! opam repository list --short --switch=5.2.0+ox | grep -Fxq default; then
+            opam repository add --switch=5.2.0+ox default https://opam.ocaml.org
+          fi
           opam install --switch=5.2.0+ox --yes ocaml-variants.5.2.0+ox
           opam install --switch=5.2.0+ox --yes ./once_campfire_oxcaml.opam --deps-only
       - name: Build

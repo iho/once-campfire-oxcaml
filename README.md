@@ -36,7 +36,8 @@ credentials, persists a Rails-schema session row, and returns a signed `session_
 First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
 room, and membership atomically, then starts a session. Authenticated users can navigate
 membership-scoped room pages, create public rooms for all active users and private rooms
-for selected members, and post plain-text messages stored in Rails Action Text and FTS
+for selected members, rename shared rooms, convert open/closed rooms while revising
+memberships transactionally, and post plain-text messages stored in Rails Action Text and FTS
 tables. Authors and administrators can edit or delete text messages, with Action Text and
 FTS updated transactionally; edit/delete requests for messages with attachments are rejected
 until attachment storage is supported. Join-code invitations create member accounts, grant access to existing public
