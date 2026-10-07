@@ -70,4 +70,56 @@ let () =
       check "login limits are per address" true
         (Database.allow_login db "127.0.0.2" ~at_ms:1_000_000L);
       check "login limit resets after three minutes" true
-        (Database.allow_login db "127.0.0.1" ~at_ms:1_180_000L))
+        (Database.allow_login db "127.0.0.1" ~at_ms:1_180_000L));
+  let setup_db = Sqlite3.db_open ":memory:" in
+  Fun.protect
+    ~finally:(fun () -> ignore (Sqlite3.db_close setup_db))
+    (fun () ->
+      exec setup_db
+        "CREATE TABLE accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,join_code TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,singleton_guard INTEGER NOT NULL DEFAULT 0 UNIQUE)";
+      exec setup_db
+        "CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email_address TEXT UNIQUE,password_digest TEXT,role INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,type TEXT NOT NULL,creator_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE memberships(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,involvement TEXT DEFAULT 'mentions',connections INTEGER NOT NULL DEFAULT 0,UNIQUE(room_id,user_id))";
+      let password_digest = Bcrypt.hash "setup password" in
+      check "generated bcrypt digest verifies" true
+        (Bcrypt.verify ~hash:password_digest "setup password");
+      let user_id =
+        Database.create_first_run (Some setup_db) ~name:"Ada Lovelace"
+          ~email_address:"ada@example.com" ~password_digest
+          ~timestamp:"2026-10-07 12:00:00.000"
+        |> Option.get
+      in
+      check "first-run user is administrator" 1
+        (Database.with_statement setup_db "SELECT role FROM users WHERE id=?" (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 user_id);
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      check "first-run creates Campfire account" "Campfire"
+        (Database.with_statement setup_db "SELECT name FROM accounts" (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0));
+      check "first-run creates All Talk open room" "Rooms::Open:All Talk"
+        (Database.with_statement setup_db "SELECT type||':'||name FROM rooms" (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0));
+      check "first-run grants creator room membership" 1
+        (Database.with_statement setup_db
+           "SELECT count(*) FROM memberships WHERE user_id=? AND room_id=(SELECT id FROM rooms)"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 user_id);
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      (try
+         ignore
+           (Database.create_first_run (Some setup_db) ~name:"Second"
+              ~email_address:"second@example.com" ~password_digest
+              ~timestamp:"2026-10-07 12:01:00.000");
+         failwith "second first-run setup unexpectedly succeeded"
+       with Failure message when message = "Campfire has already been set up" -> ());
+      check "repeat first-run leaves one user" 1
+        (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0)))

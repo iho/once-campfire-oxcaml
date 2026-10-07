@@ -46,6 +46,75 @@ let with_statement db sql f =
     ~finally:(fun () -> ignore (Sqlite3.finalize statement))
     (fun () -> f statement)
 
+let create_first_run database ~name ~email_address ~password_digest ~timestamp =
+  Option.bind database (fun db ->
+      let run sql =
+        match Sqlite3.exec db sql with
+        | Sqlite3.Rc.OK -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "first-run setup failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      let bind ?(start = 1) statement values =
+        List.iteri
+          (fun index value ->
+            check_rc db "bind first-run value"
+              (Sqlite3.bind_text statement (index + start) value))
+          values;
+        match Sqlite3.step statement with
+        | Sqlite3.Rc.DONE -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "first-run insert failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      run "BEGIN IMMEDIATE";
+      try
+        if exists db "SELECT 1 FROM accounts LIMIT 1" then
+          failwith "Campfire has already been set up";
+        with_statement db
+          "INSERT INTO accounts(name,join_code,created_at,updated_at) VALUES(?,?,?,?)"
+          (fun statement ->
+            bind statement
+              [ "Campfire"; Rails_crypto.base64url_encode (Rails_crypto.random_bytes 9);
+                timestamp; timestamp ]);
+        with_statement db
+          "INSERT INTO users(name,email_address,password_digest,role,status,created_at,updated_at) VALUES(?,?,?,1,0,?,?)"
+          (fun statement ->
+            bind statement [ name; email_address; password_digest; timestamp; timestamp ]);
+        let user_id =
+          with_statement db "SELECT last_insert_rowid()" (fun statement ->
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0
+              | _ -> failwith "first-run user insert returned no row")
+        in
+        with_statement db
+          "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES('All Talk','Rooms::Open',?,?,?)"
+          (fun statement ->
+            check_rc db "bind initial room creator"
+              (Sqlite3.bind_int statement 1 user_id);
+            bind ~start:2 statement [ timestamp; timestamp ]);
+        let room_id =
+          with_statement db "SELECT last_insert_rowid()" (fun statement ->
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0
+              | _ -> failwith "first-run room insert returned no row")
+        in
+        with_statement db
+          "INSERT INTO memberships(room_id,user_id,created_at,updated_at) VALUES(?,?,?,?)"
+          (fun statement ->
+            check_rc db "bind initial membership room"
+              (Sqlite3.bind_int statement 1 room_id);
+            check_rc db "bind initial membership user"
+              (Sqlite3.bind_int statement 2 user_id);
+            bind ~start:3 statement [ timestamp; timestamp ]);
+        run "COMMIT";
+        Some user_id
+      with error ->
+        (try run "ROLLBACK" with _ -> ());
+        raise error)
+
 let find_active_user database email_address =
   Option.bind database (fun db ->
       with_statement db

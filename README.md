@@ -33,9 +33,10 @@ existing `CAMPFIRE_STORAGE_PATH/db/production.sqlite3` without creating or migra
 Existing `$2a$`, `$2b$` and `$2y$` bcrypt digests can be verified; `GET /session/new` issues a
 Rails-compatible encrypted session cookie and CSRF form token, and `POST /session` verifies
 credentials, persists a Rails-schema session row, and returns a signed `session_token` cookie.
-The first-run account setup, authenticated Campfire screens, and forwarded-HTTPS cookie
-handling are not implemented yet. Logout deletes the session row and clears the signed
-cookie. Login attempts are limited to 10 per IP in three
+First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
+room, and membership atomically, then starts a session. Avatar upload, authenticated
+Campfire screens, and forwarded-HTTPS cookie handling are not implemented yet. Logout
+deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),
 leaving the Rails database schema untouched. The app uses Cohttp's Eio HTTP/1 server; direct
 TLS, HTTP/2 and Action Cable remain future work.
@@ -46,8 +47,9 @@ Run the native SQLite, bcrypt and Rails cookie/CSRF checks with
 ## Compatibility status
 
 No Rails compatibility or production-readiness claim is made yet. This is an early port:
-account/session authentication and the room/message feature set remain to be implemented
-against the pinned Rails reference and real SQLite fixtures. See [verification status](plans/contracts.md).
+account/session authentication is partial, and the authenticated room/message feature set
+remains to be implemented against the pinned Rails reference and real SQLite fixtures. See
+[verification status](plans/contracts.md).
 
 ## License
 

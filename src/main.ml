@@ -132,6 +132,37 @@ let login_form ?(email = "") ?(error = "") csrf =
   ^ html_escape email
   ^ "\"></label><label>Password<input type=\"password\" name=\"password\" autocomplete=\"current-password\"></label><button type=\"submit\">Sign in</button></form></main></body></html>"
 
+let first_run_form ?(name = "") ?(email = "") ?(error = "") csrf =
+  let error_html =
+    if error = "" then ""
+    else "<p role=\"alert\">" ^ html_escape error ^ "</p>"
+  in
+  "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ html_escape csrf
+  ^ "\"><title>Set up Campfire</title></head><body><main><h1>Set up Campfire</h1>"
+  ^ error_html
+  ^ "<form action=\"/first_run\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+  ^ html_escape csrf
+  ^ "\"><label>Name<input name=\"user[name]\" autocomplete=\"name\" required value=\""
+  ^ html_escape name
+  ^ "\"></label><label>Email address<input type=\"email\" name=\"user[email_address]\" autocomplete=\"username\" required value=\""
+  ^ html_escape email
+  ^ "\"></label><label>Password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" maxlength=\"72\" required></label><button type=\"submit\">Save</button></form></main></body></html>"
+
+let namespaced_form_value form namespace key =
+  let prefix = namespace ^ "[" in
+  form
+  |> List.find_map (fun (field, value) ->
+         if String.starts_with ~prefix field && String.ends_with ~suffix:"]" field
+         then
+           let field_name =
+             String.sub field (String.length prefix)
+               (String.length field - String.length prefix - 1)
+           in
+           if field_name = key then Some value else None
+         else None)
+  |> Option.value ~default:""
+
 let valid_origin headers =
   let origin = Cohttp.Header.get headers "origin" in
   match origin with
@@ -222,6 +253,59 @@ let authenticate_form database jobs_database remote_ip secret headers body =
         in
         response ~headers:response_headers `Found ""
 
+let create_first_run database remote_ip secret headers body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not
+          (Session.valid_csrf ~path:"/first_run" ~method_:"POST" session
+             authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    let name = namespaced_form_value form "user" "name" |> trim in
+    let email = namespaced_form_value form "user" "email_address" |> trim in
+    let password = namespaced_form_value form "user" "password" in
+    if name = "" || email = "" || password = "" || String.length password > 72
+    then
+      html_with_session ~headers:html_headers ~secret session
+        `Unprocessable_entity
+        (first_run_form ~name ~email
+           ~error:"Please enter a name, email address, and password no longer than 72 bytes."
+           session.Session.csrf_form_token)
+    else
+      try
+        let password_digest = Bcrypt.hash password in
+        let timestamp = timestamp_now () in
+        match
+          Database.create_first_run database ~name ~email_address:email
+            ~password_digest ~timestamp
+        with
+        | None -> response `Service_unavailable "Campfire database is unavailable"
+        | Some user_id ->
+            let token = Rails_crypto.random_bytes 18 |> Rails_crypto.base64url_encode in
+            Database.create_session database ~user_id ~token
+              ~user_agent:(header headers "user-agent") ~ip_address:remote_ip
+              ~timestamp;
+            let response_headers =
+              Cohttp.Header.init_with "location" "/"
+              |> fun headers -> attach_session_cookie headers ~secret session
+              |> fun headers -> start_session_cookie headers ~secret token
+            in
+            response ~headers:response_headers `Found ""
+      with _ ->
+        html_with_session ~headers:html_headers ~secret session
+          `Unprocessable_entity
+          (first_run_form ~name ~email
+             ~error:"Campfire could not be set up with those details."
+             session.Session.csrf_form_token)
+
 let logout database secret headers body =
   let session = load_session secret headers in
   let form = parse_form body in
@@ -257,8 +341,23 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
   | `GET, "/first_run" ->
       if Database.account_exists database then redirect "/"
       else
-        response ~headers:html_headers `OK
-          "<!doctype html><html><body><main><h1>Set up Campfire</h1><p>First-run account creation is not implemented in this OxCaml port yet.</p></main></body></html>"
+        (match secret_key_base () with
+        | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+        | Some secret ->
+            let session = load_session secret headers in
+            html_with_session ~secret session `OK
+              (first_run_form session.Session.csrf_form_token))
+  | `POST, "/first_run" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try
+             let request_body = request_body body in
+             create_first_run database remote_ip secret headers request_body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid setup request"))
   | (`GET, "/") | (`GET, "/session/new") ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
