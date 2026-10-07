@@ -29,7 +29,9 @@ The server binds `0.0.0.0:3000`; `HTTP_PORT` selects another port. `/up` is a ba
 health check. `GET /` follows the initial Rails setup/sign-in redirects, and the server
 opens an existing `CAMPFIRE_STORAGE_PATH/db/production.sqlite3` without creating or migrating
 it. First-run account creation and sign-in are not implemented; sign-in currently returns
-501. No authenticated Campfire routes are implemented yet. The app uses Cohttp's Eio HTTP/1
+501. A native bcrypt verifier for existing `$2a$`, `$2b$` and `$2y$` digests is covered by
+independently generated bcryptjs 3.0.3 vectors, but no authenticated Campfire routes are
+implemented yet. The app uses Cohttp's Eio HTTP/1
 server; direct TLS, HTTP/2 and Action Cable remain future work.
 
 Run the native SQLite checks with `opam exec --switch=5.2.0+ox -- dune runtest --profile=release`.
@@ -42,4 +44,5 @@ against the pinned Rails reference and real SQLite fixtures. See [verification s
 
 ## License
 
-MIT. The Rails reference remains a separate pinned submodule and is not modified.
+MIT. The Rails reference remains a separate pinned submodule and is not modified. The
+vendored bcrypt/Blowfish notices are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

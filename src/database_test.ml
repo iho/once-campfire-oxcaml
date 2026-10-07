@@ -7,6 +7,22 @@ let exec db sql =
   | error -> failwith (Sqlite3.Rc.to_string error ^ ": " ^ Sqlite3.errmsg db)
 
 let () =
+  let bcrypt_hash =
+    "$2a$04$abcdefghijklmnopqrstuu0//9Hm2kfER85NNo0cY8vC7Rsrlx0Yi"
+  in
+  check "bcrypt independent bcryptjs vector" true
+    (Bcrypt.verify ~hash:bcrypt_hash "oxcaml-password");
+  check "bcrypt 2b variant" true
+    (Bcrypt.verify
+       ~hash:"$2b$04$abcdefghijklmnopqrstuu0//9Hm2kfER85NNo0cY8vC7Rsrlx0Yi"
+       "oxcaml-password");
+  check "bcrypt 2y variant" true
+    (Bcrypt.verify
+       ~hash:"$2y$04$abcdefghijklmnopqrstuuyQbK3uYMNeDhpWD3ALRiFXKhkHYEr32"
+       "variant-y-password");
+  check "bcrypt rejects wrong password" false
+    (Bcrypt.verify ~hash:bcrypt_hash "not the password");
+  check "bcrypt rejects malformed hash" false (Bcrypt.verify ~hash:"bad" "password");
   check "missing database" false (Database.account_exists None);
   check "missing database user" false (Database.user_exists None);
   let db = Sqlite3.db_open ":memory:" in

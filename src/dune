@@ -1,3 +1,5 @@
+(include_subdirs unqualified)
+
 (executable
  (name main)
  (public_name campfire-oxcaml)
@@ -7,7 +9,10 @@
 (library
  (name campfire_oxcaml_core)
  (wrapped false)
- (modules database)
+ (modules bcrypt database)
+ (foreign_stubs
+  (language c)
+  (names bcrypt_stubs bcrypt blf))
  (libraries sqlite3))
 
 (test
