@@ -45,7 +45,9 @@ rooms, and start a session. Room creation honors the account's administrator-onl
 Search queries use the existing FTS index and retain the user's ten most recent
 searches. Message history supports 40-message older/newer cursors and room permalinks centered
 on a message. Members can hide a room or choose no, mention-only, or all-message notification
-involvement per membership. Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
+involvement per membership. The authenticated profile page updates a user's name, email, bio,
+and optional bcrypt password while preserving the password when the field is left blank.
+Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),

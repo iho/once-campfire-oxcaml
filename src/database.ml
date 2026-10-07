@@ -7,6 +7,8 @@ type user = {
   role : int;
 }
 
+type profile = { id : int; name : string; email_address : string; bio : string }
+
 type identity = { session_id : int; user : user }
 type room = { id : int; name : string; kind : string; creator_id : int }
 type user_option = { id : int; name : string }
@@ -24,6 +26,7 @@ exception Message_not_authorized
 exception Message_has_attachments
 exception Invalid_join_code
 exception Duplicate_email
+exception Duplicate_profile_email
 
 let path storage_root =
   Filename.concat (Filename.concat storage_root "db") "production.sqlite3"
@@ -250,6 +253,76 @@ let find_active_user database email_address =
               failwith
                 (Printf.sprintf "user lookup failed (%s): %s"
                    (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let find_profile database user_id =
+  Option.bind database (fun db ->
+      with_statement db
+        "SELECT id,name,COALESCE(email_address,''),COALESCE(bio,'') FROM users WHERE id=? AND status=0 LIMIT 1"
+        (fun statement ->
+          check_rc db "bind profile user" (Sqlite3.bind_int statement 1 user_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW ->
+              Some
+                { id = Sqlite3.column_int statement 0;
+                  name = Sqlite3.column_text statement 1;
+                  email_address = Sqlite3.column_text statement 2;
+                  bio = Sqlite3.column_text statement 3 }
+          | Sqlite3.Rc.DONE -> None
+          | error ->
+              failwith
+                (Printf.sprintf "profile lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let update_profile database ~user_id ~name ~email_address ~password_digest ~bio
+    ~timestamp =
+  Option.fold ~none:false
+      ~some:(fun db ->
+        let run sql =
+          match Sqlite3.exec db sql with
+          | Sqlite3.Rc.OK -> ()
+          | error ->
+              failwith
+                (Printf.sprintf "profile transaction failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+        in
+        run "BEGIN IMMEDIATE";
+        try
+          with_statement db
+            "UPDATE users SET name=?,email_address=?,password_digest=COALESCE(?,password_digest),bio=?,updated_at=? WHERE id=? AND status=0"
+            (fun statement ->
+              List.iteri
+                (fun index value ->
+                  check_rc db "bind profile field"
+                    (Sqlite3.bind_text statement (index + 1) value))
+                [ name; email_address ];
+              (match password_digest with
+              | None ->
+                  check_rc db "bind profile password"
+                    (Sqlite3.bind statement 3 Sqlite3.Data.NULL)
+              | Some digest ->
+                  check_rc db "bind profile password"
+                    (Sqlite3.bind_text statement 3 digest));
+              check_rc db "bind profile bio" (Sqlite3.bind_text statement 4 bio);
+              check_rc db "bind profile timestamp" (Sqlite3.bind_text statement 5 timestamp);
+              check_rc db "bind profile user id" (Sqlite3.bind_int statement 6 user_id);
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.DONE when Sqlite3.changes db = 1 -> ()
+              | Sqlite3.Rc.DONE -> failwith "active profile not found"
+              | Sqlite3.Rc.CONSTRAINT -> raise Duplicate_profile_email
+              | error ->
+                  failwith
+                    (Printf.sprintf "profile update failed (%s): %s"
+                       (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+          run "COMMIT";
+          true
+        with
+        | Duplicate_profile_email ->
+            (try run "ROLLBACK" with _ -> ());
+            false
+        | error ->
+            (try run "ROLLBACK" with _ -> ());
+            raise error)
+      database
 
 let create_session database ~user_id ~token ~user_agent ~ip_address ~timestamp =
   Option.iter

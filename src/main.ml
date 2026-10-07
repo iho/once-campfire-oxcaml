@@ -268,7 +268,7 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ " · Campfire</title><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
   ^ html_escape csrf
   ^ "\"></head><body><nav><a href=\"/\">Campfire</a> <a href=\"/searches\">Search</a><p>"
-  ^ html_escape user.Database.name
+  ^ "<a href=\"/users/me/profile\">" ^ html_escape user.Database.name ^ "</a>"
   ^ "</p><a href=\"/rooms/opens/new\">New public room</a> <a href=\"/rooms/closeds/new\">New private room</a><ul>"
   ^ links
   ^ "</ul></nav><main><h1>"
@@ -992,6 +992,81 @@ let room_response database secret headers room_id messages ~older_messages
                room session.Session.csrf_form_token messages ~older_messages
                ~newer_messages))
 
+let profile_page database secret headers ?(error = "") () =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      (match Database.find_profile database identity.Database.user.id with
+      | None -> response `Not_found "User not found"
+      | Some profile ->
+          let session = load_session secret headers in
+          let memberships =
+            Database.rooms_for_user database profile.Database.id
+            |> List.sort (fun (left : Database.room) (right : Database.room) ->
+                   compare (String.lowercase_ascii left.Database.name)
+                     (String.lowercase_ascii right.Database.name))
+            |> List.map (fun (room : Database.room) ->
+                   "<li><a href=\"/rooms/" ^ string_of_int room.Database.id
+                   ^ "\">" ^ html_escape room.Database.name ^ "</a></li>")
+            |> String.concat ""
+          in
+          let error_html =
+            if error = "" then "" else "<p role=\"alert\">" ^ html_escape error ^ "</p>"
+          in
+          html_with_session ~secret session `OK
+            ("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+            ^ html_escape session.Session.csrf_form_token
+            ^ "\"><title>" ^ html_escape profile.Database.name
+            ^ " · Campfire</title></head><body><nav><a href=\"/\">Campfire</a></nav><main><a href=\"/\">Back to Campfire</a><h1>Profile</h1>"
+            ^ error_html ^ "<form action=\"/users/me/profile\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+            ^ html_escape session.Session.csrf_form_token
+            ^ "\"><label>Name<input name=\"user[name]\" autocomplete=\"name\" required value=\""
+            ^ html_escape profile.Database.name
+            ^ "\"></label><label>Email address<input type=\"email\" name=\"user[email_address]\" autocomplete=\"username\" value=\""
+            ^ html_escape profile.Database.email_address
+            ^ "\"></label><label>Change password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" maxlength=\"72\"></label><label>Bio<textarea name=\"user[bio]\" maxlength=\"200\" rows=\"3\">"
+            ^ html_escape profile.Database.bio
+            ^ "</textarea></label><button type=\"submit\">Save profile</button></form><section><h2>Your rooms</h2><ul>"
+            ^ memberships ^ "</ul></section></main></body></html>"))
+
+let update_profile_request database secret headers body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  let path = "/users/me/profile" in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"PATCH" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        let name = namespaced_form_value form "user" "name" in
+        let email = namespaced_form_value form "user" "email_address" in
+        let password = namespaced_form_value form "user" "password" in
+        let bio = namespaced_form_value form "user" "bio" in
+        if String.length password > 72 then
+          profile_page database secret headers
+            ~error:"Password must be no longer than 72 bytes." ()
+        else
+          let password_digest =
+            if password = "" then None else Some (Bcrypt.hash password)
+          in
+          if
+            Database.update_profile database ~user_id:identity.Database.user.id
+              ~name ~email_address:email ~password_digest ~bio
+              ~timestamp:(timestamp_now ())
+          then redirect path
+          else
+            profile_page database secret headers
+              ~error:"Profile could not be saved. The email address may already be in use." ()
+
 let edit_room_page database secret headers room_id =
   match current_identity database secret headers with
   | None -> redirect "/session/new"
@@ -1184,6 +1259,30 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       | Some secret ->
           let query = query_parameters request |> fun params -> form_value params "q" in
           search_index database secret headers query)
+  | `GET, "/users/me/profile" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret -> profile_page database secret headers ())
+  | (`POST | `PATCH), "/users/me/profile" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `PATCH -> "PATCH"
+               | `POST ->
+                   parse_form body |> fun form -> form_value form "_method"
+                   |> String.uppercase_ascii
+               | _ -> ""
+             in
+             if method_ <> "PATCH" then response `Method_not_allowed "Method not allowed"
+             else update_profile_request database secret headers body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid profile update request"))
   | `GET, involvement_path when room_involvement_id involvement_path <> None ->
       (match (secret_key_base (), room_involvement_id involvement_path) with
       | Some secret, Some room_id -> involvement_page database secret headers room_id

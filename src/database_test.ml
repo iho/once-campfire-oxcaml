@@ -78,7 +78,7 @@ let () =
       exec setup_db
         "CREATE TABLE accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,join_code TEXT NOT NULL,settings TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,singleton_guard INTEGER NOT NULL DEFAULT 0 UNIQUE)";
       exec setup_db
-        "CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email_address TEXT UNIQUE,password_digest TEXT,role INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+        "CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email_address TEXT UNIQUE,password_digest TEXT,bio TEXT,role INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
         "CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,type TEXT NOT NULL,creator_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
@@ -103,6 +103,43 @@ let () =
           ~timestamp:"2026-10-07 12:00:00.000"
         |> Option.get
       in
+      exec setup_db
+        "INSERT INTO users(id,name,email_address,password_digest,bio,role,status,created_at,updated_at) VALUES(99,'Inactive','duplicate@example.com',NULL,NULL,0,1,'2026-10-07','2026-10-07')";
+      check "profile reads Rails profile fields" (Some ("Ada Lovelace", "ada@example.com", ""))
+        (Database.find_profile (Some setup_db) user_id
+        |> Option.map (fun (profile : Database.profile) ->
+               (profile.Database.name, profile.Database.email_address, profile.Database.bio)));
+      let replacement_digest = Bcrypt.hash "updated profile password" in
+      check "profile update changes identity and bcrypt password" true
+        (Database.update_profile (Some setup_db) ~user_id ~name:"Ada Byron"
+           ~email_address:"ada.byron@example.com"
+           ~password_digest:(Some replacement_digest) ~bio:"Mathematician"
+           ~timestamp:"2026-10-07 12:00:15.000");
+      check "updated profile fields are persisted"
+        (Some ("Ada Byron", "ada.byron@example.com", "Mathematician"))
+        (Database.find_profile (Some setup_db) user_id
+        |> Option.map (fun (profile : Database.profile) ->
+               (profile.Database.name, profile.Database.email_address, profile.Database.bio)));
+      check "profile password update is bcrypt-compatible" true
+        (Database.with_statement setup_db "SELECT password_digest FROM users WHERE id=?"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 user_id);
+             ignore (Sqlite3.step statement);
+             Bcrypt.verify ~hash:(Sqlite3.column_text statement 0)
+               "updated profile password"));
+      check "profile update without password preserves password digest" true
+        (Database.update_profile (Some setup_db) ~user_id ~name:"Ada Lovelace"
+           ~email_address:"ada.byron@example.com" ~password_digest:None ~bio:""
+           ~timestamp:"2026-10-07 12:00:16.000");
+      check "duplicate profile email is rejected atomically" false
+        (Database.update_profile (Some setup_db) ~user_id ~name:"Should not save"
+           ~email_address:"duplicate@example.com" ~password_digest:None ~bio:"bad"
+           ~timestamp:"2026-10-07 12:00:17.000");
+      check "failed duplicate-email update keeps existing profile"
+        (Some ("Ada Lovelace", "ada.byron@example.com", ""))
+        (Database.find_profile (Some setup_db) user_id
+        |> Option.map (fun (profile : Database.profile) ->
+               (profile.Database.name, profile.Database.email_address, profile.Database.bio)));
       check "first-run user is administrator" 1
         (Database.with_statement setup_db "SELECT role FROM users WHERE id=?" (fun statement ->
              ignore (Sqlite3.bind_int statement 1 user_id);
@@ -376,7 +413,7 @@ let () =
               ~timestamp:"2026-10-07 12:01:00.000");
          failwith "second first-run setup unexpectedly succeeded"
        with Failure message when message = "Campfire has already been set up" -> ());
-      check "repeat first-run leaves existing users unchanged" 3
+      check "repeat first-run leaves existing users unchanged" 4
         (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));
@@ -431,7 +468,7 @@ let () =
               ~timestamp:"2026-10-07 12:32:00.000");
          failwith "invalid join code unexpectedly succeeded"
        with Database.Invalid_join_code -> ());
-      check "failed invitations leave no extra user" 4
+      check "failed invitations leave no extra user" 5
         (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));
