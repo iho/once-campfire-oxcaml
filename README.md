@@ -36,8 +36,9 @@ credentials, persists a Rails-schema session row, and returns a signed `session_
 First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
 room, and membership atomically, then starts a session. Authenticated users can navigate
 membership-scoped room pages, create public rooms for all active users and private rooms
-for selected members, rename shared rooms, convert open/closed rooms while revising
-memberships transactionally, and post plain-text messages stored in Rails Action Text and FTS
+for selected members, rename/delete shared rooms, convert open/closed rooms while revising
+memberships transactionally, create/reuse participant-scoped direct conversations, and post
+plain-text messages stored in Rails Action Text and FTS
 tables. Authors and administrators can edit or delete text messages, with Action Text and
 FTS updated transactionally; edit/delete requests for messages with attachments are rejected
 until attachment storage is supported. Join-code invitations create member accounts, grant access to existing public
@@ -48,7 +49,9 @@ on a message. Members can hide a room or choose no, mention-only, or all-message
 involvement per membership. The authenticated profile page updates a user's name, email, bio,
 and optional bcrypt password while preserving the password when the field is left blank.
 Direct conversations are created or reused by exact participant set and default to notifying
-members about every message.
+members about every message; any participant can delete a direct conversation. Room deletion
+cleans text messages, boosts and search entries transactionally, but is rejected when the room
+contains attachments because storage cleanup is not implemented.
 Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three

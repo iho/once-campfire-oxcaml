@@ -24,6 +24,9 @@ type search_result = { message : message; room_id : int; room_name : string }
 exception Message_not_found
 exception Message_not_authorized
 exception Message_has_attachments
+exception Room_not_found
+exception Room_not_authorized
+exception Room_has_attachments
 exception Invalid_join_code
 exception Duplicate_email
 exception Duplicate_profile_email
@@ -1295,6 +1298,124 @@ let delete_message database ~room_id ~message_id ~user_id ~role =
                   (Printf.sprintf "message deletion failed (%s): %s"
                      (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
         run "COMMIT"
+      with error ->
+        (try run "ROLLBACK" with _ -> ());
+        raise error)
+    database
+
+let delete_room database ~room_id ~user_id ~role =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      let run sql =
+        match Sqlite3.exec db sql with
+        | Sqlite3.Rc.OK -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "room deletion failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      run "BEGIN IMMEDIATE";
+      try
+        let room_kind, creator_id =
+          with_statement db
+            "SELECT r.type,r.creator_id FROM rooms r JOIN memberships m ON m.room_id=r.id AND m.user_id=? WHERE r.id=? LIMIT 1"
+            (fun statement ->
+              check_rc db "bind room deletion user"
+                (Sqlite3.bind_int statement 1 user_id);
+              check_rc db "bind room deletion id"
+                (Sqlite3.bind_int statement 2 room_id);
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW ->
+                  (Sqlite3.column_text statement 0, Sqlite3.column_int statement 1)
+              | Sqlite3.Rc.DONE -> raise Room_not_found
+              | error ->
+                  failwith
+                    (Printf.sprintf "room deletion lookup failed (%s): %s"
+                       (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)))
+        in
+        if room_kind <> "Rooms::Direct" && role <> 1 && creator_id <> user_id then
+          raise Room_not_authorized;
+        let attachments =
+          with_statement db "SELECT id FROM messages WHERE room_id=?"
+            (fun statement ->
+              check_rc db "bind room message attachments"
+                (Sqlite3.bind_int statement 1 room_id);
+              let rec find () =
+                match Sqlite3.step statement with
+                | Sqlite3.Rc.ROW ->
+                    if message_has_attachments db (Sqlite3.column_int statement 0)
+                    then true else find ()
+                | Sqlite3.Rc.DONE -> false
+                | error ->
+                    failwith
+                      (Printf.sprintf "room messages lookup failed (%s): %s"
+                         (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+              in
+              find ())
+        in
+        if attachments then raise Room_has_attachments;
+        if exists db
+             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='boosts'"
+        then
+          with_statement db
+            "DELETE FROM boosts WHERE message_id IN (SELECT id FROM messages WHERE room_id=?)"
+            (fun statement ->
+              check_rc db "bind room boosts" (Sqlite3.bind_int statement 1 room_id);
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.DONE -> ()
+              | error ->
+                  failwith
+                    (Printf.sprintf "room boosts deletion failed (%s): %s"
+                       (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        with_statement db
+          "DELETE FROM message_search_index WHERE rowid IN (SELECT id FROM messages WHERE room_id=?)"
+          (fun statement ->
+            check_rc db "bind room search index" (Sqlite3.bind_int statement 1 room_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room search-index deletion failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        with_statement db
+          "DELETE FROM action_text_rich_texts WHERE record_type='Message' AND record_id IN (SELECT id FROM messages WHERE room_id=?)"
+          (fun statement ->
+            check_rc db "bind room rich text" (Sqlite3.bind_int statement 1 room_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room rich-text deletion failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        with_statement db "DELETE FROM messages WHERE room_id=?"
+          (fun statement ->
+            check_rc db "bind room messages" (Sqlite3.bind_int statement 1 room_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room messages deletion failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        with_statement db "DELETE FROM memberships WHERE room_id=?"
+          (fun statement ->
+            check_rc db "bind room memberships" (Sqlite3.bind_int statement 1 room_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room membership deletion failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        with_statement db "DELETE FROM rooms WHERE id=?"
+          (fun statement ->
+            check_rc db "bind deleted room" (Sqlite3.bind_int statement 1 room_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room row deletion failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        run "COMMIT";
+        true
       with error ->
         (try run "ROLLBACK" with _ -> ());
         raise error)

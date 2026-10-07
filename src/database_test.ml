@@ -555,4 +555,83 @@ let () =
            "SELECT count(*) FROM message_search_index WHERE message_search_index MATCH 'delete'"
            (fun statement ->
              ignore (Sqlite3.step statement);
-             Sqlite3.column_int statement 0)))
+             Sqlite3.column_int statement 0));
+      let deletion_room_id =
+        Database.create_closed_room (Some setup_db) ~name:"Cascade delete"
+          ~creator_id:user_id ~member_ids:[ user_id + 1 ]
+          ~timestamp:"2026-10-07 12:42:00.000"
+        |> Option.get
+      in
+      Database.create_message (Some setup_db) ~room_id:deletion_room_id
+        ~creator_id:user_id ~body:"roomcascade searchable"
+        ~client_message_id:"00000000-0000-4000-8000-000000000098"
+        ~timestamp:"2026-10-07 12:42:01.000";
+      let cascade_message_id =
+        Database.with_statement setup_db
+          "SELECT id FROM messages WHERE client_message_id='00000000-0000-4000-8000-000000000098'"
+          (fun statement ->
+            ignore (Sqlite3.step statement);
+            Sqlite3.column_int statement 0)
+      in
+      exec setup_db
+        (Printf.sprintf "INSERT INTO boosts(message_id,booster_id,content,created_at,updated_at) VALUES(%d,%d,'👍','2026-10-07','2026-10-07')"
+           cascade_message_id user_id);
+      (try
+         ignore
+           (Database.delete_room (Some setup_db) ~room_id:deletion_room_id
+              ~user_id:(user_id + 1) ~role:0);
+         failwith "non-admin non-creator room deletion unexpectedly succeeded"
+       with Database.Room_not_authorized -> ());
+      check "unauthorized room delete has no effect" true
+        (Database.find_room_for_user (Some setup_db) (user_id + 1) deletion_room_id
+        <> None);
+      check "shared-room deletion is atomic and cascades indexed content" true
+        (Database.delete_room (Some setup_db) ~room_id:deletion_room_id ~user_id
+           ~role:1);
+      check "room delete removes its message, boost, rich text, and FTS row" [ 0; 0; 0; 0 ]
+        (List.map
+           (fun sql ->
+             Database.with_statement setup_db sql (fun statement ->
+               ignore (Sqlite3.step statement);
+               Sqlite3.column_int statement 0))
+           [ "SELECT count(*) FROM messages WHERE room_id=" ^ string_of_int deletion_room_id;
+             "SELECT count(*) FROM boosts WHERE message_id=" ^ string_of_int cascade_message_id;
+             "SELECT count(*) FROM action_text_rich_texts WHERE record_type='Message' AND record_id=" ^ string_of_int cascade_message_id;
+             "SELECT count(*) FROM message_search_index WHERE rowid=" ^ string_of_int cascade_message_id ]);
+      let attached_room_id =
+        Database.create_closed_room (Some setup_db) ~name:"Keep attachments"
+          ~creator_id:user_id ~member_ids:[] ~timestamp:"2026-10-07 12:43:00.000"
+        |> Option.get
+      in
+      Database.create_message (Some setup_db) ~room_id:attached_room_id
+        ~creator_id:user_id ~body:"attached"
+        ~client_message_id:"00000000-0000-4000-8000-000000000097"
+        ~timestamp:"2026-10-07 12:43:01.000";
+      let attached_message_id =
+        Database.with_statement setup_db
+          "SELECT id FROM messages WHERE client_message_id='00000000-0000-4000-8000-000000000097'"
+          (fun statement ->
+            ignore (Sqlite3.step statement);
+            Sqlite3.column_int statement 0)
+      in
+      exec setup_db
+        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('Message',%d,'attachment',1)" attached_message_id);
+      (try
+         ignore
+           (Database.delete_room (Some setup_db) ~room_id:attached_room_id
+              ~user_id ~role:1);
+         failwith "attached room deletion unexpectedly succeeded"
+       with Database.Room_has_attachments -> ());
+      check "room with unsupported attachments stays intact" true
+        (Database.find_room_for_user (Some setup_db) user_id attached_room_id <> None
+        && Database.find_message (Some setup_db) attached_room_id attached_message_id <> None);
+      exec setup_db
+        (Printf.sprintf "DELETE FROM active_storage_attachments WHERE record_id=%d" attached_message_id);
+      ignore
+        (Database.delete_room (Some setup_db) ~room_id:attached_room_id ~user_id
+           ~role:1);
+      check "direct conversation is deletable by any participant" true
+        (Database.delete_room (Some setup_db) ~room_id:direct_room_id
+           ~user_id:(user_id + 1) ~role:0);
+      check "direct conversation deletion removes all memberships" []
+        (Database.room_member_ids (Some setup_db) direct_room_id))

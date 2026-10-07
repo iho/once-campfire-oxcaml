@@ -281,7 +281,22 @@ let room_page (user : Database.user) (rooms : Database.room list)
        " · <a href=\"/rooms/" ^ kind ^ "/" ^ string_of_int current.Database.id
        ^ "/edit\">Edit room</a>"
      else "")
-  ^ "</p><section aria-label=\"Messages\"><ol>"
+  ^ "</p>"
+  ^ (if current.Database.kind = "Rooms::Direct"
+        || current.Database.creator_id = user.Database.id || user.Database.role = 1
+     then
+       let action =
+         if current.Database.kind = "Rooms::Direct" then
+           "/rooms/directs/" ^ string_of_int current.Database.id
+         else "/rooms/" ^ string_of_int current.Database.id
+       in
+       "<form action=\"" ^ action
+       ^ "\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"delete\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+       ^ html_escape csrf ^ "\"><button type=\"submit\">"
+       ^ (if current.Database.kind = "Rooms::Direct" then "Delete conversation" else "Delete room")
+       ^ "</button></form>"
+     else "")
+  ^ "<section aria-label=\"Messages\"><ol>"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
            let actions =
@@ -322,6 +337,11 @@ let room_page (user : Database.user) (rooms : Database.room list)
 let room_id_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; id ] -> int_of_string_opt id
+  | _ -> None
+
+let direct_room_id_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; "directs"; id ] -> int_of_string_opt id
   | _ -> None
 
 let room_message_collection_id path =
@@ -1123,6 +1143,48 @@ let update_profile_request database secret headers body =
             profile_page database secret headers
               ~error:"Profile could not be saved. The email address may already be in use." ()
 
+let delete_room_request database secret headers path room_id is_direct body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"DELETE" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (match Database.find_room_for_user database identity.Database.user.id room_id with
+        | None -> response `Not_found "Room not found or inaccessible"
+        | Some room
+          when (room.Database.kind = "Rooms::Direct") <> is_direct ->
+            response `Not_found "Room not found or inaccessible"
+        | Some room
+          when not is_direct
+               && not
+                    (Database.can_administer_room database ~room_id
+                       ~user_id:identity.Database.user.id ~role:identity.Database.user.role) ->
+            response `Forbidden "Room administration is not allowed"
+        | Some _ ->
+            (try
+               if Database.delete_room database ~room_id
+                    ~user_id:identity.Database.user.id ~role:identity.Database.user.role
+               then redirect "/"
+               else response `Service_unavailable "Campfire database is unavailable"
+             with
+            | Database.Room_not_found -> response `Not_found "Room not found"
+            | Database.Room_not_authorized ->
+                response `Forbidden "Room deletion is not allowed"
+            | Database.Room_has_attachments ->
+                response `Unprocessable_entity
+                  "Deleting rooms with attachments is not yet supported"))
+
 let edit_room_page database secret headers room_id =
   match current_identity database secret headers with
   | None -> redirect "/session/new"
@@ -1617,6 +1679,51 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
           | Request_body_too_large ->
               response `Request_entity_too_large "Request body too large"
           | _ -> response `Bad_request "Invalid message request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | (`POST | `DELETE), room_path when room_id_of_path room_path <> None ->
+      (match (secret_key_base (), room_id_of_path room_path) with
+      | Some secret, Some room_id ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `DELETE -> "DELETE"
+               | `POST ->
+                   parse_form body |> fun form -> form_value form "_method"
+                   |> String.uppercase_ascii
+               | _ -> ""
+             in
+             if method_ <> "DELETE" then response `Method_not_allowed "Method not allowed"
+             else
+               delete_room_request database secret headers room_path room_id false body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid room deletion request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | (`POST | `DELETE), direct_room_path
+    when direct_room_id_of_path direct_room_path <> None ->
+      (match (secret_key_base (), direct_room_id_of_path direct_room_path) with
+      | Some secret, Some room_id ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `DELETE -> "DELETE"
+               | `POST ->
+                   parse_form body |> fun form -> form_value form "_method"
+                   |> String.uppercase_ascii
+               | _ -> ""
+             in
+             if method_ <> "DELETE" then response `Method_not_allowed "Method not allowed"
+             else
+               delete_room_request database secret headers direct_room_path room_id true body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid direct-room deletion request")
       | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | _, None -> response `Not_found "Not found")
   | `GET, room_path ->
