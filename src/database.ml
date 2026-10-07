@@ -372,10 +372,12 @@ let rooms_for_user database user_id =
   Option.fold ~none:[]
     ~some:(fun db ->
       with_statement db
-        "SELECT r.id,COALESCE(r.name,''),r.type,r.creator_id FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY r.created_at,r.id"
+        "SELECT r.id,CASE WHEN r.type='Rooms::Direct' THEN COALESCE((SELECT group_concat(name, ', ') FROM (SELECT u.name AS name FROM memberships dm JOIN users u ON u.id=dm.user_id WHERE dm.room_id=r.id AND dm.user_id<>? ORDER BY lower(u.name))), 'Direct conversation') ELSE COALESCE(r.name,'') END,r.type,r.creator_id FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY r.created_at,r.id"
         (fun statement ->
-          check_rc db "bind room membership user"
+          check_rc db "bind direct-room display user"
             (Sqlite3.bind_int statement 1 user_id);
+          check_rc db "bind room membership user"
+            (Sqlite3.bind_int statement 2 user_id);
           let rec collect rooms =
             match Sqlite3.step statement with
             | Sqlite3.Rc.ROW ->
@@ -609,6 +611,108 @@ let create_closed_room database ~name ~creator_id ~member_ids ~timestamp =
                          failwith
                            (Printf.sprintf "room membership insert failed (%s): %s"
                               (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))));
+        run "COMMIT";
+        Some room_id
+      with error ->
+        (try run "ROLLBACK" with _ -> ());
+        raise error)
+
+let find_or_create_direct_room database ~creator_id ~member_ids ~timestamp =
+  Option.bind database (fun db ->
+      let run sql =
+        match Sqlite3.exec db sql with
+        | Sqlite3.Rc.OK -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "direct-room transaction failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      run "BEGIN IMMEDIATE";
+      try
+        let active id =
+          exists db
+            (Printf.sprintf
+               "SELECT 1 FROM users WHERE id=%d AND status=0 LIMIT 1" id)
+        in
+        if not (active creator_id) then failwith "active direct-room creator required";
+        let user_exists id =
+          exists db
+            (Printf.sprintf "SELECT 1 FROM users WHERE id=%d LIMIT 1" id)
+        in
+        let member_ids =
+          creator_id :: member_ids
+          |> List.sort_uniq compare
+          |> List.filter user_exists
+        in
+        let direct_room_ids =
+          with_statement db
+            "SELECT id FROM rooms WHERE type='Rooms::Direct' ORDER BY id"
+            (fun statement ->
+              let rec collect ids =
+                match Sqlite3.step statement with
+                | Sqlite3.Rc.ROW -> collect (Sqlite3.column_int statement 0 :: ids)
+                | Sqlite3.Rc.DONE -> List.rev ids
+                | error ->
+                    failwith
+                      (Printf.sprintf "direct-room lookup failed (%s): %s"
+                         (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+              in
+              collect [])
+        in
+        let existing =
+          List.find_opt
+            (fun room_id ->
+              room_member_ids database room_id |> List.sort_uniq compare = member_ids)
+            direct_room_ids
+        in
+        let room_id =
+          match existing with
+          | Some room_id -> room_id
+          | None ->
+              with_statement db
+                "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES(NULL,'Rooms::Direct',?,?,?)"
+                (fun statement ->
+                  check_rc db "bind direct-room creator"
+                    (Sqlite3.bind_int statement 1 creator_id);
+                  List.iteri
+                    (fun index value ->
+                      check_rc db "bind direct-room timestamp"
+                        (Sqlite3.bind_text statement (index + 2) value))
+                    [ timestamp; timestamp ];
+                  match Sqlite3.step statement with
+                  | Sqlite3.Rc.DONE -> ()
+                  | error ->
+                      failwith
+                        (Printf.sprintf "direct-room insert failed (%s): %s"
+                           (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+              let id =
+                with_statement db "SELECT last_insert_rowid()" (fun statement ->
+                    match Sqlite3.step statement with
+                    | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0
+                    | _ -> failwith "direct-room insert returned no row")
+              in
+              List.iter
+                (fun user_id ->
+                  with_statement db
+                    "INSERT INTO memberships(room_id,user_id,involvement,created_at,updated_at) VALUES(?,?,'everything',?,?)"
+                    (fun statement ->
+                      check_rc db "bind direct membership room"
+                        (Sqlite3.bind_int statement 1 id);
+                      check_rc db "bind direct membership user"
+                        (Sqlite3.bind_int statement 2 user_id);
+                      check_rc db "bind direct membership created_at"
+                        (Sqlite3.bind_text statement 3 timestamp);
+                      check_rc db "bind direct membership updated_at"
+                        (Sqlite3.bind_text statement 4 timestamp);
+                      match Sqlite3.step statement with
+                      | Sqlite3.Rc.DONE -> ()
+                      | error ->
+                          failwith
+                            (Printf.sprintf "direct membership insert failed (%s): %s"
+                               (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+                member_ids;
+              id
+        in
         run "COMMIT";
         Some room_id
       with error ->

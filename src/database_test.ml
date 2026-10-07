@@ -323,8 +323,15 @@ let () =
         "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES('Direct test','Rooms::Direct',1,'2026-10-07','2026-10-07')";
       exec setup_db
         "INSERT INTO memberships(room_id,user_id,created_at,updated_at) SELECT id,1,'2026-10-07','2026-10-07' FROM rooms WHERE name='Direct test'";
+      let direct_test_id =
+        Database.with_statement setup_db
+          "SELECT id FROM rooms WHERE name='Direct test'"
+          (fun statement ->
+            ignore (Sqlite3.step statement);
+            Sqlite3.column_int statement 0)
+      in
       check "direct room history cannot be promoted to shared" false
-        (Database.update_shared_room (Some setup_db) ~room_id:3 ~user_id ~role:1
+        (Database.update_shared_room (Some setup_db) ~room_id:direct_test_id ~user_id ~role:1
            ~name:"Exposed history" ~kind:"Rooms::Open" ~member_ids:[]
            ~timestamp:"2026-10-07 12:03:25.000");
       let closed_room_id =
@@ -352,6 +359,39 @@ let () =
                | error -> failwith (Sqlite3.Rc.to_string error)
              in
              collect []));
+      let direct_room_id =
+        Database.find_or_create_direct_room (Some setup_db) ~creator_id:user_id
+          ~member_ids:[ user_id + 1; user_id + 1; 99 ]
+          ~timestamp:"2026-10-07 12:03:45.000"
+        |> Option.get
+      in
+      check "direct room has direct Rails type" "Rooms::Direct"
+        (Database.with_statement setup_db "SELECT type FROM rooms WHERE id=?"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 direct_room_id);
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0));
+      check "direct room grants existing selected participants" [ 1; 2; 99 ]
+        (Database.room_member_ids (Some setup_db) direct_room_id);
+      check "direct room defaults to all-message involvement"
+        [ Some "everything"; Some "everything"; Some "everything" ]
+        (List.map
+           (fun participant ->
+             Database.membership_involvement (Some setup_db) ~room_id:direct_room_id
+               ~user_id:participant)
+           [ 1; 2; 99 ]);
+      check "direct room display name excludes current user" "Grace, Inactive"
+        (Database.find_room_for_user (Some setup_db) user_id direct_room_id
+        |> Option.map (fun (room : Database.room) -> room.Database.name)
+        |> Option.value ~default:"");
+      check "direct room is singleton for the exact participant set" direct_room_id
+        (Database.find_or_create_direct_room (Some setup_db) ~creator_id:(user_id + 1)
+           ~member_ids:[ user_id; 99 ] ~timestamp:"2026-10-07 12:03:50.000"
+        |> Option.get);
+      check "different direct participant set creates a separate room" true
+        (Database.find_or_create_direct_room (Some setup_db) ~creator_id:user_id
+           ~member_ids:[] ~timestamp:"2026-10-07 12:03:55.000"
+        |> Option.get <> direct_room_id);
       exec setup_db
         "UPDATE accounts SET settings='{\"restrict_room_creation_to_administrators\":true}'";
       check "account setting restricts room creation" true
@@ -362,7 +402,7 @@ let () =
               ~creator_id:(user_id + 2) ~timestamp:"2026-10-07 12:04:00.000");
          failwith "inactive room creator unexpectedly succeeded"
        with Failure message when message = "active room creator required" -> ());
-      check "failed open-room creation is rolled back" 4
+      check "failed open-room creation is rolled back" 5
         (Database.with_statement setup_db "SELECT count(*) FROM rooms" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));

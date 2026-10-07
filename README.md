@@ -47,6 +47,8 @@ searches. Message history supports 40-message older/newer cursors and room perma
 on a message. Members can hide a room or choose no, mention-only, or all-message notification
 involvement per membership. The authenticated profile page updates a user's name, email, bio,
 and optional bcrypt password while preserving the password when the field is left blank.
+Direct conversations are created or reused by exact participant set and default to notifying
+members about every message.
 Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three

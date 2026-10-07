@@ -269,7 +269,7 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ html_escape csrf
   ^ "\"></head><body><nav><a href=\"/\">Campfire</a> <a href=\"/searches\">Search</a><p>"
   ^ "<a href=\"/users/me/profile\">" ^ html_escape user.Database.name ^ "</a>"
-  ^ "</p><a href=\"/rooms/opens/new\">New public room</a> <a href=\"/rooms/closeds/new\">New private room</a><ul>"
+  ^ "</p><a href=\"/rooms/opens/new\">New public room</a> <a href=\"/rooms/closeds/new\">New private room</a> <a href=\"/rooms/directs/new\">New direct conversation</a><ul>"
   ^ links
   ^ "</ul></nav><main><h1>"
   ^ html_escape current.Database.name
@@ -819,6 +819,30 @@ let closed_room_form database secret headers =
         ^ users
         ^ "</ul></fieldset><button type=\"submit\">Create private room</button></form></main></body></html>")
 
+let new_direct_room database secret headers =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      let session = load_session secret headers in
+      let users =
+        Database.active_users database
+        |> List.filter (fun (user : Database.user_option) ->
+               user.Database.id <> identity.Database.user.id)
+        |> List.map (fun (user : Database.user_option) ->
+               "<li><label><input type=\"checkbox\" name=\"user_ids[]\" value=\""
+               ^ string_of_int user.Database.id ^ "\">"
+               ^ html_escape user.Database.name ^ "</label></li>")
+        |> String.concat ""
+      in
+      html_with_session ~secret session `OK
+        ("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+        ^ html_escape session.Session.csrf_form_token
+        ^ "\"><title>New direct conversation · Campfire</title></head><body><main><a href=\"/\">Campfire</a><h1>Start a direct conversation</h1><form action=\"/rooms/directs\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+        ^ html_escape session.Session.csrf_form_token
+        ^ "\"><fieldset><legend>People to ping</legend><ul>"
+        ^ users
+        ^ "</ul></fieldset><button type=\"submit\">Start conversation</button></form></main></body></html>")
+
 let new_open_room database secret headers =
   match current_identity database secret headers with
   | None -> redirect "/session/new"
@@ -896,6 +920,38 @@ let create_closed_room_request database secret headers body =
          with
         | Some room_id -> redirect ("/rooms/" ^ string_of_int room_id)
         | None -> response `Unprocessable_entity "Room could not be saved")
+
+let create_direct_room_request database secret headers body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not
+          (Session.valid_csrf ~path:"/rooms/directs" ~method_:"POST" session
+             authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        let member_ids =
+          parse_form_pairs body
+          |> List.filter_map (fun (key, value) ->
+                 if key = "user_ids[]" then int_of_string_opt value else None)
+        in
+        (match
+           Database.find_or_create_direct_room database
+             ~creator_id:identity.Database.user.id ~member_ids
+             ~timestamp:(timestamp_now ())
+         with
+        | Some room_id -> redirect ("/rooms/" ^ string_of_int room_id)
+        | None -> response `Service_unavailable "Campfire database is unavailable")
 
 let record_search_request database secret headers body =
   let session = load_session secret headers in
@@ -1356,6 +1412,10 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | Some secret -> closed_room_form database secret headers)
+  | `GET, "/rooms/directs/new" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret -> new_direct_room database secret headers)
   | `POST, "/rooms/closeds" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
@@ -1365,6 +1425,16 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
           | Request_body_too_large ->
               response `Request_entity_too_large "Request body too large"
           | _ -> response `Bad_request "Invalid room request"))
+  | `POST, "/rooms/directs" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try
+             create_direct_room_request database secret headers (request_body body)
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid direct-room request"))
   | `POST, "/searches" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
