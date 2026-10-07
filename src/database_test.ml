@@ -126,6 +126,21 @@ let () =
         |> List.map (fun (room : Database.room) -> (room.name, room.kind)));
       check "room lookup rejects non-member" None
         (Database.find_room_for_user (Some setup_db) (user_id + 1) 1);
+      check "first-run membership defaults to mentions" (Some "mentions")
+        (Database.membership_involvement (Some setup_db) ~room_id:1
+           ~user_id);
+      check "membership notification preference can be updated" true
+        (Database.update_membership_involvement (Some setup_db) ~room_id:1
+           ~user_id ~involvement:"everything" ~timestamp:"2026-10-07 12:00:30.000");
+      check "updated membership preference is stored" (Some "everything")
+        (Database.membership_involvement (Some setup_db) ~room_id:1 ~user_id);
+      check "invalid membership preference is rejected" false
+        (Database.update_membership_involvement (Some setup_db) ~room_id:1
+           ~user_id ~involvement:"invalid" ~timestamp:"2026-10-07 12:00:31.000");
+      check "non-member preference update is rejected" false
+        (Database.update_membership_involvement (Some setup_db) ~room_id:1
+           ~user_id:(user_id + 1) ~involvement:"nothing"
+           ~timestamp:"2026-10-07 12:00:32.000");
       Database.create_message (Some setup_db) ~room_id:1 ~creator_id:user_id
         ~body:"hello <script>&\nagain" ~client_message_id:"00000000-0000-4000-8000-000000000001"
         ~timestamp:"2026-10-07 12:01:00.000";

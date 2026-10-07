@@ -273,7 +273,8 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ links
   ^ "</ul></nav><main><h1>"
   ^ html_escape current.Database.name
-  ^ "</h1><section aria-label=\"Messages\"><ol>"
+  ^ "</h1><p><a href=\"/rooms/" ^ string_of_int current.Database.id
+  ^ "/involvement\">Notification preferences</a></p><section aria-label=\"Messages\"><ol>"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
            let actions =
@@ -319,6 +320,11 @@ let room_id_of_path path =
 let room_message_collection_id path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; id; "messages" ] -> int_of_string_opt id
+  | _ -> None
+
+let room_involvement_id path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; id; "involvement" ] -> int_of_string_opt id
   | _ -> None
 
 let room_at_message path =
@@ -971,6 +977,69 @@ let room_response database secret headers room_id messages ~older_messages
                room session.Session.csrf_form_token messages ~older_messages
                ~newer_messages))
 
+let involvement_page database secret headers room_id =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      (match Database.find_room_for_user database identity.Database.user.id room_id with
+      | None -> response `Not_found "Room not found or inaccessible"
+      | Some room ->
+          let session = load_session secret headers in
+          (match Database.membership_involvement database ~room_id
+                   ~user_id:identity.Database.user.id with
+          | None -> response `Not_found "Membership not found"
+          | Some current ->
+              let options =
+                [ ("invisible", "Hide this room");
+                  ("nothing", "No notifications");
+                  ("mentions", "Only when mentioned");
+                  ("everything", "All messages") ]
+                |> List.map (fun (value, label) ->
+                       let selected = if value = current then " selected" else "" in
+                       "<option value=\"" ^ value ^ "\"" ^ selected ^ ">"
+                       ^ label ^ "</option>")
+                |> String.concat ""
+              in
+              html_with_session ~secret session `OK
+                ("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+                ^ html_escape session.Session.csrf_form_token
+                ^ "\"><title>Notification preferences · Campfire</title></head><body><main><a href=\"/rooms/"
+                ^ string_of_int room.Database.id
+                ^ "\">Back to room</a><h1>Notification preferences</h1><form action=\"/rooms/"
+                ^ string_of_int room_id
+                ^ "/involvement\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+                ^ html_escape session.Session.csrf_form_token
+                ^ "\"><label>Notify me<select name=\"involvement\">" ^ options
+                ^ "</select></label><button type=\"submit\">Save preferences</button></form></main></body></html>")))
+
+let update_involvement_request database secret headers room_id body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  let path = "/rooms/" ^ string_of_int room_id ^ "/involvement" in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"PATCH" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (match Database.find_room_for_user database identity.Database.user.id room_id with
+        | None -> response `Not_found "Room not found or inaccessible"
+        | Some _ ->
+            let involvement = form_value form "involvement" in
+            if Database.update_membership_involvement database ~room_id
+                 ~user_id:identity.Database.user.id ~involvement
+                 ~timestamp:(timestamp_now ())
+            then redirect path
+            else response `Unprocessable_entity "Invalid notification preference")
+
 let serve_request ~database ~jobs_database ~remote_ip request body =
   let path = path_of_request request in
   let headers = Cohttp.Request.headers request in
@@ -1007,6 +1076,33 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       | Some secret ->
           let query = query_parameters request |> fun params -> form_value params "q" in
           search_index database secret headers query)
+  | `GET, involvement_path when room_involvement_id involvement_path <> None ->
+      (match (secret_key_base (), room_involvement_id involvement_path) with
+      | Some secret, Some room_id -> involvement_page database secret headers room_id
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | (`POST | `PATCH), involvement_path
+    when room_involvement_id involvement_path <> None ->
+      (match (secret_key_base (), room_involvement_id involvement_path) with
+      | Some secret, Some room_id ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `PATCH -> "PATCH"
+               | `POST ->
+                   let override = form_value (parse_form body) "_method" in
+                   String.uppercase_ascii override
+               | _ -> ""
+             in
+             if method_ <> "PATCH" then response `Method_not_allowed "Method not allowed"
+             else update_involvement_request database secret headers room_id body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid notification preference request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
   | `GET, "/rooms/opens/new" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"

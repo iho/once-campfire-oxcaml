@@ -324,6 +324,48 @@ let find_room_for_user database user_id room_id =
   rooms_for_user database user_id
   |> List.find_opt (fun (room : room) -> room.id = room_id)
 
+let membership_involvement database ~room_id ~user_id =
+  Option.bind database (fun db ->
+      with_statement db
+        "SELECT involvement FROM memberships WHERE room_id=? AND user_id=? LIMIT 1"
+        (fun statement ->
+          check_rc db "bind involvement room" (Sqlite3.bind_int statement 1 room_id);
+          check_rc db "bind involvement user" (Sqlite3.bind_int statement 2 user_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW -> Some (Sqlite3.column_text statement 0)
+          | Sqlite3.Rc.DONE -> None
+          | error ->
+              failwith
+                (Printf.sprintf "membership involvement lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let update_membership_involvement database ~room_id ~user_id ~involvement
+    ~timestamp =
+  let valid = [ "invisible"; "nothing"; "mentions"; "everything" ] in
+  if not (List.mem involvement valid) then false
+  else
+    Option.fold ~none:false
+      ~some:(fun db ->
+        with_statement db
+          "UPDATE memberships SET involvement=?,updated_at=? WHERE room_id=? AND user_id=?"
+          (fun statement ->
+            List.iteri
+              (fun index value ->
+                check_rc db "bind membership involvement"
+                  (Sqlite3.bind_text statement (index + 1) value))
+              [ involvement; timestamp ];
+            check_rc db "bind involvement room"
+              (Sqlite3.bind_int statement 3 room_id);
+            check_rc db "bind involvement user"
+              (Sqlite3.bind_int statement 4 user_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> Sqlite3.changes db > 0
+            | error ->
+                failwith
+                  (Printf.sprintf "membership involvement update failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+      database
+
 let active_users database =
   Option.fold ~none:[]
     ~some:(fun db ->

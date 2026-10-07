@@ -43,7 +43,8 @@ until attachment storage is supported. Join-code invitations create member accou
 rooms, and start a session. Room creation honors the account's administrator-only setting.
 Search queries use the existing FTS index and retain the user's ten most recent
 searches. Message history supports 40-message older/newer cursors and room permalinks centered
-on a message. Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
+on a message. Members can hide a room or choose no, mention-only, or all-message notification
+involvement per membership. Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),
