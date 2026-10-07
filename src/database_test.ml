@@ -88,6 +88,8 @@ let () =
       exec setup_db
         "CREATE TABLE action_text_rich_texts(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,body TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(record_type,record_id,name))";
       exec setup_db "CREATE VIRTUAL TABLE message_search_index USING fts5(body)";
+      exec setup_db
+        "CREATE TABLE searches(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,query TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       let password_digest = Bcrypt.hash "setup password" in
       check "generated bcrypt digest verifies" true
         (Bcrypt.verify ~hash:password_digest "setup password");
@@ -135,6 +137,33 @@ let () =
            (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));
+      check "search finds only messages in the user's rooms" [ ("All Talk", "Ada Lovelace") ]
+        (Database.search_messages (Some setup_db) user_id "\"hello\""
+        |> List.map (fun (result : Database.search_result) ->
+               (result.Database.room_name, result.Database.message.Database.creator_name)));
+      check "search excludes rooms without membership" []
+        (Database.search_messages (Some setup_db) (user_id + 1) "\"hello\"");
+      Database.record_search (Some setup_db) user_id "hello campfire"
+        "2026-10-07 12:02:00.000";
+      Database.record_search (Some setup_db) user_id "hello campfire"
+        "2026-10-07 12:03:00.000";
+      check "recent search is updated rather than duplicated" [ "hello campfire" ]
+        (Database.recent_searches (Some setup_db) user_id);
+      for index = 1 to 11 do
+        Database.record_search (Some setup_db) user_id
+          (Printf.sprintf "recent-%02d" index)
+          (Printf.sprintf "2026-10-07 12:%02d:00.000" (index + 3))
+      done;
+      let recents = Database.recent_searches (Some setup_db) user_id in
+      check "recent search list is capped at ten" 10 (List.length recents);
+      check "recent searches are newest first" "recent-11" (List.hd recents);
+      Database.record_search (Some setup_db) (user_id + 1) "private history"
+        "2026-10-07 12:20:00.000";
+      Database.clear_searches (Some setup_db) user_id;
+      check "clear removes only that user's searches" []
+        (Database.recent_searches (Some setup_db) user_id);
+      check "clearing history preserves other users" [ "private history" ]
+        (Database.recent_searches (Some setup_db) (user_id + 1));
       (try
          Database.create_message (Some setup_db) ~room_id:1
            ~creator_id:(user_id + 1) ~body:"forbidden"

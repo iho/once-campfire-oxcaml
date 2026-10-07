@@ -10,6 +10,7 @@ type user = {
 type identity = { session_id : int; user : user }
 type room = { id : int; name : string; kind : string }
 type message = { id : int; creator_name : string; body_html : string; created_at : string }
+type search_result = { message : message; room_id : int; room_name : string }
 
 let path storage_root =
   Filename.concat (Filename.concat storage_root "db") "production.sqlite3"
@@ -336,6 +337,129 @@ let create_message database ~room_id ~creator_id ~body ~client_message_id ~times
       with error ->
         (try run "ROLLBACK" with _ -> ());
         raise error)
+    database
+
+let search_messages database user_id fts_query =
+  Option.fold ~none:[]
+    ~some:(fun db ->
+      with_statement db
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at,r.name,m.room_id FROM messages m JOIN rooms r ON r.id=m.room_id JOIN users u ON u.id=m.creator_id JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? JOIN message_search_index idx ON idx.rowid=m.id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE idx.body MATCH ? ORDER BY m.created_at DESC,m.id DESC LIMIT 100"
+        (fun statement ->
+          check_rc db "bind search membership user"
+            (Sqlite3.bind_int statement 1 user_id);
+          check_rc db "bind message search query"
+            (Sqlite3.bind_text statement 2 fts_query);
+          let rec collect results =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                let message =
+                  { id = Sqlite3.column_int statement 0;
+                    creator_name = Sqlite3.column_text statement 1;
+                    body_html = Sqlite3.column_text statement 2;
+                    created_at = Sqlite3.column_text statement 3 }
+                in
+                collect
+                  ({ message; room_name = Sqlite3.column_text statement 4;
+                     room_id = Sqlite3.column_int statement 5 }
+                  :: results)
+            | Sqlite3.Rc.DONE -> List.rev results
+            | error ->
+                failwith
+                  (Printf.sprintf "message search failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
+
+let recent_searches database user_id =
+  Option.fold ~none:[]
+    ~some:(fun db ->
+      with_statement db
+        "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC,id DESC LIMIT 10"
+        (fun statement ->
+          check_rc db "bind recent-search user"
+            (Sqlite3.bind_int statement 1 user_id);
+          let rec collect queries =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW -> collect (Sqlite3.column_text statement 0 :: queries)
+            | Sqlite3.Rc.DONE -> List.rev queries
+            | error ->
+                failwith
+                  (Printf.sprintf "recent-search lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
+
+let record_search database user_id query timestamp =
+  Option.iter
+    (fun db ->
+      with_statement db "BEGIN IMMEDIATE" (fun statement ->
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE -> ()
+          | error -> check_rc db "begin search transaction" error);
+      try
+        let existing_id =
+          with_statement db "SELECT id FROM searches WHERE user_id=? AND query=? LIMIT 1"
+            (fun statement ->
+              check_rc db "bind search owner" (Sqlite3.bind_int statement 1 user_id);
+              check_rc db "bind search text" (Sqlite3.bind_text statement 2 query);
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Some (Sqlite3.column_int statement 0)
+              | Sqlite3.Rc.DONE -> None
+              | error ->
+                  failwith
+                    (Printf.sprintf "search lookup failed (%s): %s"
+                       (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)))
+        in
+        (match existing_id with
+        | Some id ->
+            with_statement db "UPDATE searches SET updated_at=? WHERE id=? AND user_id=?"
+              (fun statement ->
+                check_rc db "bind search timestamp" (Sqlite3.bind_text statement 1 timestamp);
+                check_rc db "bind search id" (Sqlite3.bind_int statement 2 id);
+                check_rc db "bind search owner" (Sqlite3.bind_int statement 3 user_id);
+                match Sqlite3.step statement with
+                | Sqlite3.Rc.DONE -> ()
+                | error -> check_rc db "update search" error)
+        | None ->
+            with_statement db
+              "INSERT INTO searches(user_id,query,created_at,updated_at) VALUES(?,?,?,?)"
+              (fun statement ->
+                check_rc db "bind search owner" (Sqlite3.bind_int statement 1 user_id);
+                List.iteri
+                  (fun index value ->
+                    check_rc db "bind new search"
+                      (Sqlite3.bind_text statement (index + 2) value))
+                  [ query; timestamp; timestamp ];
+                match Sqlite3.step statement with
+                | Sqlite3.Rc.DONE -> ()
+                | error -> check_rc db "insert search" error));
+        with_statement db
+          "DELETE FROM searches WHERE user_id=? AND id NOT IN (SELECT id FROM searches WHERE user_id=? ORDER BY updated_at DESC,id DESC LIMIT 10)"
+          (fun statement ->
+            check_rc db "bind search cleanup owner" (Sqlite3.bind_int statement 1 user_id);
+            check_rc db "bind search cleanup query" (Sqlite3.bind_int statement 2 user_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error -> check_rc db "cleanup searches" error);
+        with_statement db "COMMIT" (fun statement ->
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error -> check_rc db "commit search transaction" error)
+      with error ->
+        (try ignore (Sqlite3.exec db "ROLLBACK") with _ -> ());
+        raise error)
+    database
+
+let clear_searches database user_id =
+  Option.iter
+    (fun db ->
+      with_statement db "DELETE FROM searches WHERE user_id=?" (fun statement ->
+          check_rc db "bind clear-search owner" (Sqlite3.bind_int statement 1 user_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE -> ()
+          | error -> check_rc db "clear searches" error))
     database
 
 let delete_session database session_id =

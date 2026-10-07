@@ -36,7 +36,8 @@ credentials, persists a Rails-schema session row, and returns a signed `session_
 First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
 room, and membership atomically, then starts a session. Authenticated users can navigate
 membership-scoped room pages and post plain-text messages stored in Rails Action Text and FTS
-tables; avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
+tables. Search queries use the existing FTS index and retain the user's ten most recent
+searches. Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),

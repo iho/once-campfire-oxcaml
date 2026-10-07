@@ -82,6 +82,16 @@ let html_with_session ?(headers = html_headers) ~secret session status body =
 let path_of_request request =
   Cohttp.Request.resource request |> String.split_on_char '?' |> List.hd
 
+let query_parameters request =
+  match String.index_opt (Cohttp.Request.resource request) '?' with
+  | None -> []
+  | Some index ->
+      let query =
+        String.sub (Cohttp.Request.resource request) (index + 1)
+          (String.length (Cohttp.Request.resource request) - index - 1)
+      in
+      parse_form query
+
 let secret_key_base () = Sys.getenv_opt "SECRET_KEY_BASE"
 
 let load_session secret headers =
@@ -224,7 +234,7 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ html_escape current.Database.name
   ^ " · Campfire</title><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
   ^ html_escape csrf
-  ^ "\"></head><body><nav><a href=\"/\">Campfire</a><p>"
+  ^ "\"></head><body><nav><a href=\"/\">Campfire</a> <a href=\"/searches\">Search</a><p>"
   ^ html_escape user.Database.name ^ "</p><ul>" ^ links
   ^ "</ul></nav><main><h1>"
   ^ html_escape current.Database.name
@@ -250,6 +260,74 @@ let message_room_id_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; id; "messages" ] -> int_of_string_opt id
   | _ -> None
+
+let normalize_search_query query =
+  let buffer = Buffer.create (String.length query) in
+  String.iter
+    (fun character ->
+      let code = Char.code character in
+      if character = '_' || (code >= Char.code 'a' && code <= Char.code 'z')
+         || (code >= Char.code 'A' && code <= Char.code 'Z')
+         || (code >= Char.code '0' && code <= Char.code '9') || code >= 128
+      then Buffer.add_char buffer character
+      else Buffer.add_char buffer ' ')
+    query;
+  Buffer.contents buffer |> String.trim |> String.split_on_char ' '
+  |> List.filter (fun token -> token <> "") |> String.concat " "
+
+let fts_expression query =
+  query |> String.split_on_char ' '
+  |> List.filter (fun word -> word <> "")
+  |> List.map (fun word -> "\"" ^ String.concat "\"\"" (String.split_on_char '"' word) ^ "\"")
+  |> String.concat " "
+
+let encode_query query =
+  let output = Buffer.create (String.length query) in
+  let digits = "0123456789ABCDEF" in
+  String.iter
+    (function
+      | ' ' -> Buffer.add_char output '+'
+      | character when
+          (character >= 'a' && character <= 'z')
+          || (character >= 'A' && character <= 'Z')
+          || (character >= '0' && character <= '9')
+          || String.contains "-_.~" character -> Buffer.add_char output character
+      | character ->
+          let byte = Char.code character in
+          Buffer.add_char output '%';
+          Buffer.add_char output digits.[byte lsr 4];
+          Buffer.add_char output digits.[byte land 15])
+    query;
+  Buffer.contents output
+
+let search_page (user : Database.user) csrf query recents results =
+  let recent_html =
+    recents
+    |> List.map (fun recent ->
+           "<li><a href=\"/searches?q=" ^ encode_query recent ^ "\">"
+           ^ html_escape recent ^ "</a></li>")
+    |> String.concat ""
+  in
+  let result_html =
+    results
+    |> List.map (fun (result : Database.search_result) ->
+           let message = result.Database.message in
+           "<li><article><a href=\"/rooms/" ^ string_of_int result.Database.room_id
+           ^ "\">" ^ html_escape result.Database.room_name ^ "</a><header><strong>"
+           ^ html_escape message.Database.creator_name ^ "</strong> <time>"
+           ^ html_escape message.Database.created_at ^ "</time></header><div>"
+           ^ safe_message_body message.Database.body_html ^ "</div></article></li>")
+    |> String.concat ""
+  in
+  "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ html_escape csrf ^ "\"><title>Search · Campfire</title></head><body><nav><a href=\"/\">Campfire</a><p>"
+  ^ html_escape user.Database.name ^ "</p></nav><main><h1>Search Campfire</h1><form action=\"/searches\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+  ^ html_escape csrf ^ "\"><label>Search messages<input name=\"q\" required value=\""
+  ^ html_escape query ^ "\"></label><button>Search</button></form><section><h2>Recent searches</h2><ul>"
+  ^ recent_html
+  ^ "</ul><form action=\"/searches/clear\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"delete\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+  ^ html_escape csrf ^ "\"><button>Clear recent searches</button></form></section><section><h2>Results</h2><ol>"
+  ^ result_html ^ "</ol></section></main></body></html>"
 
 let create_message_id () =
   let hex = Rails_crypto.random_bytes 16 |> Rails_crypto.hex in
@@ -435,6 +513,66 @@ let submit_message database secret headers room_id body =
                 redirect ("/rooms/" ^ string_of_int room_id)
               with _ -> response `Unprocessable_entity "Message could not be saved")
 
+let search_index database secret headers query =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      let session = load_session secret headers in
+      let query = normalize_search_query query in
+      let results =
+        let expression = fts_expression query in
+        if expression = "" then []
+        else Database.search_messages database identity.Database.user.id expression
+      in
+      html_with_session ~secret session `OK
+        (search_page identity.Database.user session.Session.csrf_form_token query
+           (Database.recent_searches database identity.Database.user.id) results)
+
+let record_search_request database secret headers body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path:"/searches" ~method_:"POST" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        let query = form_value form "q" |> normalize_search_query in
+        if query <> "" then
+          Database.record_search database identity.Database.user.id query
+            (timestamp_now ());
+        redirect ("/searches?q=" ^ encode_query query)
+
+let clear_searches_request database secret headers body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not
+          (Session.valid_csrf ~path:"/searches/clear" ~method_:"DELETE" session
+             authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        Database.clear_searches database identity.Database.user.id;
+        redirect "/searches"
+
 let logout database secret headers body =
   let session = load_session secret headers in
   let form = parse_form body in
@@ -476,6 +614,32 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
             let session = load_session secret headers in
             html_with_session ~secret session `OK
               (first_run_form session.Session.csrf_form_token))
+  | `GET, "/searches" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          let query = query_parameters request |> fun params -> form_value params "q" in
+          search_index database secret headers query)
+  | `POST, "/searches" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try
+             record_search_request database secret headers (request_body body)
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid search request"))
+  | (`POST | `DELETE), "/searches/clear" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try
+             clear_searches_request database secret headers (request_body body)
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid search request"))
   | `POST, "/first_run" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
