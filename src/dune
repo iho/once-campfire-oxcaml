@@ -1,4 +1,16 @@
 (executable
  (name main)
  (public_name campfire-oxcaml)
- (libraries base cohttp-eio eio_main sqlite3 yojson))
+ (modules main)
+ (libraries campfire_oxcaml_core base cohttp-eio eio_main sqlite3 yojson))
+
+(library
+ (name campfire_oxcaml_core)
+ (wrapped false)
+ (modules database)
+ (libraries sqlite3))
+
+(test
+ (name database_test)
+ (modules database_test)
+ (libraries campfire_oxcaml_core sqlite3))

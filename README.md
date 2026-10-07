@@ -25,17 +25,20 @@ opam exec --switch=5.2.0+ox -- dune build --profile=release
 opam exec --switch=5.2.0+ox -- dune exec campfire-oxcaml
 ```
 
-The initial server binds `0.0.0.0:3000`; `HTTP_PORT` selects another port. `/up` is a
-basic process health check. It does not mean the Campfire routes or persistence layer are
-implemented yet. If `CAMPFIRE_STORAGE_PATH/db/production.sqlite3` exists, the server opens
-that Rails database without creating or migrating it. The application currently uses
-Cohttp's Eio HTTP/1 server; direct TLS, HTTP/2 and Action Cable support are future milestones.
+The server binds `0.0.0.0:3000`; `HTTP_PORT` selects another port. `/up` is a basic process
+health check. `GET /` follows the initial Rails setup/sign-in redirects, and the server
+opens an existing `CAMPFIRE_STORAGE_PATH/db/production.sqlite3` without creating or migrating
+it. First-run account creation and sign-in are not implemented; sign-in currently returns
+501. No authenticated Campfire routes are implemented yet. The app uses Cohttp's Eio HTTP/1
+server; direct TLS, HTTP/2 and Action Cable remain future work.
+
+Run the native SQLite checks with `opam exec --switch=5.2.0+ox -- dune runtest --profile=release`.
 
 ## Compatibility status
 
-No Rails compatibility or production-readiness claim is made yet. The first milestone is
-to boot a native OxCaml server; Campfire behavior will be added against the pinned Rails
-reference and real SQLite fixtures. See [verification status](plans/contracts.md).
+No Rails compatibility or production-readiness claim is made yet. This is an early port:
+account/session authentication and the room/message feature set remain to be implemented
+against the pinned Rails reference and real SQLite fixtures. See [verification status](plans/contracts.md).
 
 ## License
 

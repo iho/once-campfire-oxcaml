@@ -12,10 +12,12 @@ RUN opam init --disable-sandboxing --bare --yes \
     && opam repository add --switch=5.2.0+ox default https://opam.ocaml.org \
     && opam install --switch=5.2.0+ox --yes ocaml-variants.5.2.0+ox
 
-COPY . .
+COPY once_campfire_oxcaml.opam ./once_campfire_oxcaml.opam
 RUN opam install --switch=5.2.0+ox --yes ./once_campfire_oxcaml.opam --deps-only
 
-RUN opam exec --switch=5.2.0+ox -- dune build --profile=release
+COPY . .
+RUN opam exec --switch=5.2.0+ox -- dune build --profile=release @all \
+    && opam exec --switch=5.2.0+ox -- dune runtest --profile=release
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

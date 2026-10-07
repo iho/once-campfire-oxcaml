@@ -1,16 +1,37 @@
-let serve ~port ~domains =
+let response ?(headers = Cohttp.Header.init ()) status body =
+  Cohttp_eio.Server.respond_string ~status ~headers ~body ()
+
+let redirect target =
+  response
+    ~headers:(Cohttp.Header.init_with "location" target)
+    `Found ""
+
+let serve ~database ~port ~domains =
   Eio_main.run (fun env ->
       let server =
         Cohttp_eio.Server.make
           ~callback:(fun _connection request _body ->
             let path = Cohttp.Request.resource request |> String.split_on_char '?' |> List.hd in
-            match path with
-            | "/up" ->
-                Cohttp_eio.Server.respond_string ~status:`OK
-                  ~body:
-                    "<!doctype html><html><body style=\"background-color: green\">OK</body></html>"
-                  ()
-            | _ -> Cohttp_eio.Server.respond_string ~status:`Not_found ~body:"Not found" ())
+            match (Cohttp.Request.meth request, path) with
+            | `GET, "/up" ->
+                response `OK
+                  "<!doctype html><html><body style=\"background-color: green\">OK</body></html>"
+            | `GET, "/" ->
+                redirect
+                  (if Database.account_exists database then "/session/new"
+                   else "/first_run")
+            | `GET, "/first_run" ->
+                if Database.account_exists database then redirect "/"
+                else
+                  response ~headers:(Cohttp.Header.init_with "content-type" "text/html; charset=utf-8")
+                    `OK
+                    "<!doctype html><html><body><main><h1>Set up Campfire</h1><p>First-run account creation is not implemented in this OxCaml port yet.</p></main></body></html>"
+            | `GET, "/session/new" ->
+                if Database.user_exists database then
+                  response ~headers:(Cohttp.Header.init_with "content-type" "text/html; charset=utf-8")
+                    `Not_implemented "Campfire sign-in is not implemented in this OxCaml port yet."
+                else redirect "/first_run"
+            | _ -> response `Not_found "Not found")
           ()
       in
       Eio.Switch.run (fun sw ->
@@ -40,4 +61,4 @@ let () =
   let database = Database.open_existing storage_root in
   Fun.protect
     ~finally:(fun () -> Option.iter (fun db -> ignore (Sqlite3.db_close db)) database)
-    (fun () -> serve ~port ~domains)
+    (fun () -> serve ~database ~port ~domains)

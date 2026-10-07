@@ -25,3 +25,5 @@ jobs:
           opam install --switch=5.2.0+ox --yes ./once_campfire_oxcaml.opam --deps-only
       - name: Build
         run: opam exec --switch=5.2.0+ox -- dune build --profile=release
+      - name: Test
+        run: opam exec --switch=5.2.0+ox -- dune runtest --profile=release
