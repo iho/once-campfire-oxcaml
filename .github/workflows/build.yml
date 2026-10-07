@@ -10,8 +10,7 @@ jobs:
     container: debian:trixie-slim
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+        # The Rails reference submodule is not needed by the OxCaml build or tests.
       - name: Install system prerequisites
         run: |
           apt-get update
