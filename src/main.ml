@@ -163,6 +163,28 @@ let namespaced_form_value form namespace key =
          else None)
   |> Option.value ~default:""
 
+let room_page (user : Database.user) (rooms : Database.room list)
+    (current : Database.room) =
+  let links =
+    rooms
+    |> List.map (fun room ->
+           "<li><a href=\"/rooms/" ^ string_of_int room.Database.id ^ "\">"
+           ^ html_escape room.Database.name ^ "</a></li>")
+    |> String.concat ""
+  in
+  "<!doctype html><html><head><meta charset=\"utf-8\"><title>"
+  ^ html_escape current.Database.name
+  ^ " · Campfire</title></head><body><nav><a href=\"/\">Campfire</a><p>"
+  ^ html_escape user.Database.name ^ "</p><ul>" ^ links
+  ^ "</ul></nav><main><h1>"
+  ^ html_escape current.Database.name
+  ^ "</h1><section aria-label=\"Messages\"><p>Messages in this room are not rendered by this OxCaml milestone yet.</p></section></main></body></html>"
+
+let room_id_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; id ] -> int_of_string_opt id
+  | _ -> None
+
 let valid_origin headers =
   let origin = Cohttp.Header.get headers "origin" in
   match origin with
@@ -370,9 +392,14 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
                 "/first_run"
             else
               (match current_identity database secret headers with
-              | Some _ ->
-                  html_with_session ~secret session `Not_implemented
-                    "Campfire screens are not implemented in this OxCaml port yet."
+              | Some identity ->
+                  (match Database.rooms_for_user database identity.Database.user.id with
+                  | room :: _ -> redirect ("/rooms/" ^ string_of_int room.Database.id)
+                  | [] ->
+                      html_with_session ~secret session `OK
+                        ("<!doctype html><html><body><h1>No rooms yet</h1><p>"
+                        ^ html_escape identity.Database.user.name
+                        ^ "</p></body></html>"))
               | None ->
                   redirect
                     ~headers:(attach_session_cookie (Cohttp.Header.init ()) ~secret session)
@@ -384,6 +411,22 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
             redirect
               ~headers:(attach_session_cookie (Cohttp.Header.init ()) ~secret session)
               "/first_run")
+  | `GET, room_path ->
+      (match (secret_key_base (), room_id_of_path room_path) with
+      | Some secret, Some room_id ->
+          (match current_identity database secret headers with
+          | None -> redirect "/session/new"
+          | Some identity ->
+              (match Database.find_room_for_user database identity.Database.user.id room_id with
+              | None -> response `Not_found "Room not found or inaccessible"
+              | Some room ->
+                  let session = load_session secret headers in
+                  html_with_session ~secret session `OK
+                    (room_page identity.Database.user
+                       (Database.rooms_for_user database identity.Database.user.id)
+                       room)))
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
   | `POST, "/session" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"

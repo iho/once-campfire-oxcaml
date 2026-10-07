@@ -34,8 +34,9 @@ Existing `$2a$`, `$2b$` and `$2y$` bcrypt digests can be verified; `GET /session
 Rails-compatible encrypted session cookie and CSRF form token, and `POST /session` verifies
 credentials, persists a Rails-schema session row, and returns a signed `session_token` cookie.
 First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
-room, and membership atomically, then starts a session. Avatar upload, authenticated
-Campfire screens, and forwarded-HTTPS cookie handling are not implemented yet. Logout
+room, and membership atomically, then starts a session. Authenticated users can now navigate
+membership-scoped room pages; message rendering/posting, avatar upload, and forwarded-HTTPS
+cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),
 leaving the Rails database schema untouched. The app uses Cohttp's Eio HTTP/1 server; direct

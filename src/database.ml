@@ -8,6 +8,7 @@ type user = {
 }
 
 type identity = { session_id : int; user : user }
+type room = { id : int; name : string; kind : string }
 
 let path storage_root =
   Filename.concat (Filename.concat storage_root "db") "production.sqlite3"
@@ -176,11 +177,40 @@ let find_session_identity database token =
                         (match Sqlite3.column statement 3 with
                         | Sqlite3.Data.NULL -> None
                         | _ -> Some (Sqlite3.column_text statement 3));
-                      role = Sqlite3.column_int statement 4 } }
+                   role = Sqlite3.column_int statement 4 } }
           | error ->
               failwith
                 (Printf.sprintf "session lookup failed (%s): %s"
                    (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let rooms_for_user database user_id =
+  Option.fold ~none:[]
+    ~some:(fun db ->
+      with_statement db
+        "SELECT r.id,COALESCE(r.name,''),r.type FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY r.created_at,r.id"
+        (fun statement ->
+          check_rc db "bind room membership user"
+            (Sqlite3.bind_int statement 1 user_id);
+          let rec collect rooms =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                collect
+                  ({ id = Sqlite3.column_int statement 0;
+                     name = Sqlite3.column_text statement 1;
+                     kind = Sqlite3.column_text statement 2 }
+                  :: rooms)
+            | Sqlite3.Rc.DONE -> List.rev rooms
+            | error ->
+                failwith
+                  (Printf.sprintf "room lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
+
+let find_room_for_user database user_id room_id =
+  rooms_for_user database user_id
+  |> List.find_opt (fun room -> room.id = room_id)
 
 let delete_session database session_id =
   Option.iter

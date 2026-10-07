@@ -46,7 +46,7 @@ let () =
       check "existing user" true (Database.user_exists (Some db));
       check "active user lookup" (Some "David")
         (Database.find_active_user (Some db) "david@example.com"
-        |> Option.map (fun user -> user.Database.name));
+        |> Option.map (fun (user : Database.user) -> user.Database.name));
       check "email lookup is exact" None
         (Database.find_active_user (Some db) "DAVID@example.com");
       Database.create_session (Some db) ~user_id:1 ~token:"session-token"
@@ -105,6 +105,11 @@ let () =
         (Database.with_statement setup_db "SELECT type||':'||name FROM rooms" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_text statement 0));
+      check "membership-scoped room list" [ ("All Talk", "Rooms::Open") ]
+        (Database.rooms_for_user (Some setup_db) user_id
+        |> List.map (fun (room : Database.room) -> (room.name, room.kind)));
+      check "room lookup rejects non-member" None
+        (Database.find_room_for_user (Some setup_db) (user_id + 1) 1);
       check "first-run grants creator room membership" 1
         (Database.with_statement setup_db
            "SELECT count(*) FROM memberships WHERE user_id=? AND room_id=(SELECT id FROM rooms)"
