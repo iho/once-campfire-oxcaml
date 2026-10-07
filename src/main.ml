@@ -349,6 +349,19 @@ let render_message_item ~secret ?(room_name = "") ?(boosts = [])
   ^ (boosts |> List.map (render_boost ~secret) |> String.concat "")
   ^ "</div></div></article></div>"
 
+let render_live_message ~secret database ~room_name user room_id csrf
+    (message : Database.message) =
+  let boosts =
+    Database.boosts_for_messages database [ message ]
+    |> List.assoc_opt message.Database.id |> Option.value ~default:[]
+  in
+  let attachments =
+    Database.attachments_for_messages database [ message ]
+    |> List.assoc_opt message.Database.id |> Option.to_list
+  in
+  render_message_item ~secret ~room_name ~boosts ~attachments user room_id csrf
+    message
+
 let room_page ~secret (user : Database.user) (rooms : Database.room list)
     (current : Database.room) csrf (messages : Database.message list)
     ~boosts_by_message ~attachments_by_message ~older_messages ~newer_messages ~room_stream =
@@ -841,6 +854,12 @@ let submit_message message_bus database secret headers room_id body =
         | None -> response `Not_found "Room not found or inaccessible"
         | Some room ->
             let content = namespaced_form_value form "message" "body" in
+            let client_message_id =
+              namespaced_form_value form "message" "client_message_id" |> trim
+            in
+            let client_message_id =
+              if client_message_id = "" then create_message_id () else client_message_id
+            in
             let attachment_token =
               namespaced_form_value form "message" "attachment" |> trim
             in
@@ -862,7 +881,7 @@ let submit_message message_bus database secret headers room_id body =
               try
                 (match Database.create_message_with_id ?attachment_blob_id database ~room_id
                   ~creator_id:identity.Database.user.id ~body:content
-                  ~client_message_id:(create_message_id ())
+                  ~client_message_id
                   ~timestamp:(timestamp_now ()) with
                 | Some message_id ->
                     Option.iter
@@ -879,10 +898,9 @@ let submit_message message_bus database secret headers room_id body =
                       let html =
                         "<turbo-stream action=\"append\" target=\"room_"
                         ^ string_of_int room_id ^ "_messages\"><template>"
-                        ^ render_message_item ~secret
-                            ~room_name:(room.Database.name)
-                            identity.Database.user room_id
-                            session.Session.csrf_form_token message
+                        ^ render_live_message ~secret database
+                            ~room_name:room.Database.name identity.Database.user
+                            room_id session.Session.csrf_form_token message
                         ^ "</template></turbo-stream>"
                       in
                       let headers =
@@ -2505,8 +2523,9 @@ let cable_websocket env database message_bus database_lock identity secret csrf 
           let html =
             "<turbo-stream action=\"append\" target=\"room_"
             ^ string_of_int room_id ^ "_messages\"><template>"
-            ^ render_message_item ~secret ~room_name:(room_name room_id)
-                identity.Database.user room_id csrf message
+            ^ render_live_message ~secret database
+                ~room_name:(room_name room_id) identity.Database.user room_id csrf
+                message
             ^ "</template></turbo-stream>"
           in
           send_stream identifier html
@@ -2515,8 +2534,9 @@ let cable_websocket env database message_bus database_lock identity secret csrf 
       let html =
             "<turbo-stream action=\"replace\" target=\"message_"
             ^ html_escape message.Database.client_message_id ^ "\"><template>"
-            ^ render_message_item ~secret ~room_name:(room_name room_id)
-                identity.Database.user room_id csrf message
+            ^ render_live_message ~secret database
+                ~room_name:(room_name room_id) identity.Database.user room_id csrf
+                message
             ^ "</template></turbo-stream>"
           in
           send_stream identifier html
