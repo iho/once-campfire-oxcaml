@@ -242,6 +242,17 @@ let safe_message_body body =
   body |> html_body_to_text |> html_escape |> String.split_on_char '\n'
   |> String.concat "<br>"
 
+let message_edit_form (user : Database.user) csrf room_id
+    (message : Database.message) =
+  let body = message.Database.body_html |> html_body_to_text |> html_escape in
+  "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ html_escape csrf ^ "\"><title>Edit message · Campfire</title></head><body><main><a href=\"/rooms/"
+  ^ string_of_int room_id ^ "\">Back to room</a><h1>Edit message</h1><form action=\"/rooms/"
+  ^ string_of_int room_id ^ "/messages/" ^ string_of_int message.Database.id
+  ^ "\" method=\"post\"><input type=\"hidden\" name=\"_method\" value=\"patch\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+  ^ html_escape csrf ^ "\"><label>Message<textarea name=\"message[body]\" required maxlength=\"10000\">"
+  ^ body ^ "</textarea></label><button type=\"submit\">Save changes</button></form></main></body></html>"
+
 let room_page (user : Database.user) (rooms : Database.room list)
     (current : Database.room) csrf (messages : Database.message list)
     ~older_messages ~newer_messages =
@@ -265,11 +276,24 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ "</h1><section aria-label=\"Messages\"><ol>"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
+           let actions =
+             if user.Database.role = 1 || user.Database.id = message.Database.creator_id
+             then
+               let path =
+                 "/rooms/" ^ string_of_int current.Database.id ^ "/messages/"
+                 ^ string_of_int message.Database.id
+               in
+               " <a href=\"" ^ path ^ "/edit\">Edit</a><form action=\"" ^ path
+               ^ "\" method=\"post\" style=\"display:inline\"><input type=\"hidden\" name=\"_method\" value=\"delete\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+               ^ html_escape csrf ^ "\"><button type=\"submit\">Delete</button></form>"
+             else ""
+           in
            "<li id=\"message-" ^ string_of_int message.Database.id
            ^ "\"><article><header><strong>" ^ html_escape message.Database.creator_name
            ^ "</strong> <time>" ^ html_escape message.Database.created_at
            ^ "</time></header><div class=\"message-body\">"
-           ^ safe_message_body message.Database.body_html ^ "</div></article></li>")
+           ^ safe_message_body message.Database.body_html ^ "</div>" ^ actions
+           ^ "</article></li>")
     |> String.concat "")
   ^ "</ol></section><nav aria-label=\"Message history\">"
   ^ (match (older_messages, messages) with
@@ -310,6 +334,22 @@ let room_at_message path =
 let join_code_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "join"; code ] when code <> "" -> Some code
+  | _ -> None
+
+let room_message_member_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; room_id; "messages"; message_id ] ->
+      Option.bind (int_of_string_opt room_id) (fun room_id ->
+          Option.map (fun message_id -> (room_id, message_id))
+            (int_of_string_opt message_id))
+  | _ -> None
+
+let room_message_edit_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; room_id; "messages"; message_id; "edit" ] ->
+      Option.bind (int_of_string_opt room_id) (fun room_id ->
+          Option.map (fun message_id -> (room_id, message_id))
+            (int_of_string_opt message_id))
   | _ -> None
 
 let message_room_id_of_path path =
@@ -639,6 +679,74 @@ let submit_message database secret headers room_id body =
                   ~timestamp:(timestamp_now ());
                 redirect ("/rooms/" ^ string_of_int room_id)
               with _ -> response `Unprocessable_entity "Message could not be saved")
+
+let edit_message_page database secret headers room_id message_id =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      (match Database.find_room_for_user database identity.Database.user.id room_id with
+      | None -> response `Not_found "Room not found or inaccessible"
+      | Some _ ->
+          (match Database.find_message database room_id message_id with
+          | None -> response `Not_found "Message not found"
+          | Some message
+            when message.Database.creator_id <> identity.Database.user.id
+                 && identity.Database.user.role <> 1 ->
+              response `Forbidden "Message editing is not allowed"
+          | Some message ->
+              let session = load_session secret headers in
+              html_with_session ~secret session `OK
+                (message_edit_form identity.Database.user
+                   session.Session.csrf_form_token room_id message)))
+
+let mutate_message_request database secret headers room_id message_id method_
+    body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  let path =
+    "/rooms/" ^ string_of_int room_id ^ "/messages/" ^ string_of_int message_id
+  in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_ session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (try
+           (match method_ with
+           | "PATCH" | "PUT" ->
+               let content = namespaced_form_value form "message" "body" in
+               if String.trim content = "" || String.length content > 10_000 then
+                 response `Unprocessable_entity
+                   "Message must contain 1–10000 bytes"
+               else (
+                 Database.update_message database ~room_id ~message_id
+                   ~user_id:identity.Database.user.id
+                   ~role:identity.Database.user.role ~body:content
+                   ~timestamp:(timestamp_now ());
+                 redirect path)
+           | "DELETE" ->
+               Database.delete_message database ~room_id ~message_id
+                 ~user_id:identity.Database.user.id
+                 ~role:identity.Database.user.role;
+               redirect ("/rooms/" ^ string_of_int room_id)
+           | _ -> response `Method_not_allowed "Method not allowed")
+         with
+        | Database.Message_not_found -> response `Not_found "Message not found"
+        | Database.Message_not_authorized ->
+            response `Forbidden "Message editing is not allowed"
+        | Database.Message_has_attachments ->
+            response `Unprocessable_entity
+              "Editing or deleting messages with attachments is not yet supported"
+        | _ -> response `Unprocessable_entity "Message could not be saved")
 
 let search_index database secret headers query =
   match current_identity database secret headers with
@@ -1042,6 +1150,26 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
                      response `Not_found "Message not found in room")))
       | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | _, None -> response `Not_found "Not found")
+  | `GET, edit_path when room_message_edit_of_path edit_path <> None ->
+      (match (secret_key_base (), room_message_edit_of_path edit_path) with
+      | Some secret, Some (room_id, message_id) ->
+          edit_message_page database secret headers room_id message_id
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | `GET, message_path when room_message_member_of_path message_path <> None ->
+      (match (secret_key_base (), room_message_member_of_path message_path) with
+      | Some secret, Some (room_id, message_id) ->
+          (match current_identity database secret headers with
+          | None -> redirect "/session/new"
+          | Some identity ->
+              (match Database.find_room_for_user database identity.Database.user.id room_id with
+              | None -> response `Not_found "Room not found or inaccessible"
+              | Some _ ->
+                  if Database.find_message database room_id message_id = None then
+                    response `Not_found "Message not found"
+                  else redirect ("/rooms/" ^ string_of_int room_id ^ "/@" ^ string_of_int message_id)))
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
   | `GET, at_message_path when room_at_message at_message_path <> None ->
       (match (secret_key_base (), room_at_message at_message_path) with
       | Some secret, Some (room_id, message_id) ->
@@ -1050,6 +1178,31 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
           in
           room_response database secret headers room_id messages
             ~older_messages:true ~newer_messages:true
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | (`POST | `PATCH | `PUT | `DELETE), message_path
+    when room_message_member_of_path message_path <> None ->
+      (match (secret_key_base (), room_message_member_of_path message_path) with
+      | Some secret, Some (room_id, message_id) ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `POST ->
+                   parse_form body |> fun form -> form_value form "_method"
+                   |> String.uppercase_ascii
+                   |> fun override -> if override = "" then "POST" else override
+               | `PATCH -> "PATCH"
+               | `PUT -> "PUT"
+               | `DELETE -> "DELETE"
+               | _ -> "POST"
+             in
+             mutate_message_request database secret headers room_id message_id
+               method_ body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid message request")
       | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | _, None -> response `Not_found "Not found")
   | `POST, message_path when message_room_id_of_path message_path <> None ->

@@ -87,6 +87,10 @@ let () =
         "CREATE TABLE messages(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,creator_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
         "CREATE TABLE action_text_rich_texts(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,body TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(record_type,record_id,name))";
+      exec setup_db
+        "CREATE TABLE boosts(id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL,booster_id INTEGER NOT NULL,content TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE active_storage_attachments(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,blob_id INTEGER NOT NULL)";
       exec setup_db "CREATE VIRTUAL TABLE message_search_index USING fts5(body)";
       exec setup_db
         "CREATE TABLE searches(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,query TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
@@ -177,6 +181,37 @@ let () =
              Sqlite3.column_int statement 0));
       exec setup_db
         "INSERT INTO users(id,name,email_address,role,status,created_at,updated_at) VALUES(2,'Grace','grace@example.com',0,0,'2026-10-07','2026-10-07'),(3,'Inactive','inactive@example.com',0,1,'2026-10-07','2026-10-07')";
+      exec setup_db
+        "INSERT INTO memberships(room_id,user_id,created_at,updated_at) VALUES(1,2,'2026-10-07','2026-10-07')";
+      (try
+         Database.update_message (Some setup_db) ~room_id:1 ~message_id:1
+           ~user_id:2 ~role:0 ~body:"unauthorized edit"
+           ~timestamp:"2026-10-07 12:02:30.000";
+         failwith "non-author message edit unexpectedly succeeded"
+       with Database.Message_not_authorized -> ());
+      check "unauthorized edit preserves the original body" true
+        (Database.find_message (Some setup_db) 1 1
+        |> Option.map (fun (message : Database.message) ->
+               String.starts_with ~prefix:"<div>hello" message.body_html)
+        |> Option.value ~default:false);
+      Database.update_message (Some setup_db) ~room_id:1 ~message_id:1
+        ~user_id:user_id ~role:1 ~body:"edited <b>message</b>"
+        ~timestamp:"2026-10-07 12:02:31.000";
+      check "message edit stores escaped Action Text" "<div>edited &lt;b&gt;message&lt;/b&gt;</div>"
+        (Database.find_message (Some setup_db) 1 1
+        |> Option.get |> fun (message : Database.message) -> message.body_html);
+      check "message edit removes stale FTS terms" 0
+        (Database.with_statement setup_db
+           "SELECT count(*) FROM message_search_index WHERE message_search_index MATCH 'hello'"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      check "message edit indexes the new body" 1
+        (Database.with_statement setup_db
+           "SELECT count(*) FROM message_search_index WHERE message_search_index MATCH 'edited'"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
       check "active room-form users omit inactive accounts"
         [ "Ada Lovelace"; "Grace" ]
         (Database.active_users (Some setup_db)
@@ -350,5 +385,49 @@ let () =
        with Database.Invalid_join_code -> ());
       check "failed invitations leave no extra user" 4
         (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      Database.create_message (Some setup_db) ~room_id:1 ~creator_id:user_id
+        ~body:"delete me" ~client_message_id:"00000000-0000-4000-8000-000000000099"
+        ~timestamp:"2026-10-07 12:40:00.000";
+      let delete_id =
+        Database.with_statement setup_db
+          "SELECT id FROM messages WHERE client_message_id='00000000-0000-4000-8000-000000000099'"
+          (fun statement ->
+            ignore (Sqlite3.step statement);
+            Sqlite3.column_int statement 0)
+      in
+      exec setup_db
+        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('Message',%d,'attachment',1)" delete_id);
+      (try
+         Database.update_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+           ~user_id ~role:1 ~body:"drop attachment" ~timestamp:"2026-10-07 12:41:00.000";
+         failwith "attached message edit unexpectedly succeeded"
+       with Database.Message_has_attachments -> ());
+      check "unsupported attached-message edit is non-destructive" "<div>delete me</div>"
+        (Database.find_message (Some setup_db) 1 delete_id
+        |> Option.get |> fun (message : Database.message) -> message.body_html);
+      (try
+         Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+           ~user_id ~role:1;
+         failwith "attached message deletion unexpectedly succeeded"
+       with Database.Message_has_attachments -> ());
+      check "unsupported attached-message deletion is non-destructive" true
+        (Database.find_message (Some setup_db) 1 delete_id <> None);
+      exec setup_db
+        (Printf.sprintf "DELETE FROM active_storage_attachments WHERE record_id=%d" delete_id);
+      (try
+         Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+           ~user_id:2 ~role:0;
+         failwith "non-author message deletion unexpectedly succeeded"
+       with Database.Message_not_authorized -> ());
+      check "unauthorized delete preserves the message" true
+        (Database.find_message (Some setup_db) 1 delete_id <> None);
+      Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+        ~user_id ~role:1;
+      check "message deletion removes the row and FTS entry" 0
+        (Database.with_statement setup_db
+           "SELECT count(*) FROM message_search_index WHERE message_search_index MATCH 'delete'"
+           (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0)))

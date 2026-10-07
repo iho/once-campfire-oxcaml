@@ -37,7 +37,9 @@ First-run setup creates the Rails-shaped Campfire account, administrator, “All
 room, and membership atomically, then starts a session. Authenticated users can navigate
 membership-scoped room pages, create public rooms for all active users and private rooms
 for selected members, and post plain-text messages stored in Rails Action Text and FTS
-tables. Join-code invitations create member accounts, grant access to existing public
+tables. Authors and administrators can edit or delete text messages, with Action Text and
+FTS updated transactionally; edit/delete requests for messages with attachments are rejected
+until attachment storage is supported. Join-code invitations create member accounts, grant access to existing public
 rooms, and start a session. Room creation honors the account's administrator-only setting.
 Search queries use the existing FTS index and retain the user's ten most recent
 searches. Message history supports 40-message older/newer cursors and room permalinks centered
