@@ -83,6 +83,11 @@ let () =
         "CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,type TEXT NOT NULL,creator_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
         "CREATE TABLE memberships(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,involvement TEXT DEFAULT 'mentions',connections INTEGER NOT NULL DEFAULT 0,UNIQUE(room_id,user_id))";
+      exec setup_db
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,creator_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE action_text_rich_texts(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,body TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(record_type,record_id,name))";
+      exec setup_db "CREATE VIRTUAL TABLE message_search_index USING fts5(body)";
       let password_digest = Bcrypt.hash "setup password" in
       check "generated bcrypt digest verifies" true
         (Bcrypt.verify ~hash:password_digest "setup password");
@@ -110,6 +115,32 @@ let () =
         |> List.map (fun (room : Database.room) -> (room.name, room.kind)));
       check "room lookup rejects non-member" None
         (Database.find_room_for_user (Some setup_db) (user_id + 1) 1);
+      Database.create_message (Some setup_db) ~room_id:1 ~creator_id:user_id
+        ~body:"hello <script>&\nagain" ~client_message_id:"00000000-0000-4000-8000-000000000001"
+        ~timestamp:"2026-10-07 12:01:00.000";
+      check "message reads through Rails Action Text" 1
+        (Database.messages_for_room (Some setup_db) 1 |> List.length);
+      check "message text is escaped in Rails Action Text storage"
+        "<div>hello &lt;script&gt;&amp;</div><div>again</div>"
+        (Database.messages_for_room (Some setup_db) 1
+        |> List.hd |> fun (message : Database.message) -> message.body_html);
+      check "message is indexed for Rails search" 1
+        (Database.with_statement setup_db
+           "SELECT count(*) FROM message_search_index WHERE message_search_index MATCH 'hello'"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      (try
+         Database.create_message (Some setup_db) ~room_id:1
+           ~creator_id:(user_id + 1) ~body:"forbidden"
+           ~client_message_id:"00000000-0000-4000-8000-000000000002"
+           ~timestamp:"2026-10-07 12:02:00.000";
+         failwith "non-member message unexpectedly succeeded"
+       with Failure message when message = "room membership required" -> ());
+      check "unauthorized message leaves no row" 1
+        (Database.with_statement setup_db "SELECT count(*) FROM messages" (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
       check "first-run grants creator room membership" 1
         (Database.with_statement setup_db
            "SELECT count(*) FROM memberships WHERE user_id=? AND room_id=(SELECT id FROM rooms)"

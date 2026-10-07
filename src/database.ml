@@ -9,6 +9,7 @@ type user = {
 
 type identity = { session_id : int; user : user }
 type room = { id : int; name : string; kind : string }
+type message = { id : int; creator_name : string; body_html : string; created_at : string }
 
 let path storage_root =
   Filename.concat (Filename.concat storage_root "db") "production.sqlite3"
@@ -210,7 +211,119 @@ let rooms_for_user database user_id =
 
 let find_room_for_user database user_id room_id =
   rooms_for_user database user_id
-  |> List.find_opt (fun room -> room.id = room_id)
+  |> List.find_opt (fun (room : room) -> room.id = room_id)
+
+let messages_for_room database room_id =
+  Option.fold ~none:[]
+    ~some:(fun db ->
+      with_statement db
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='content' WHERE m.room_id=? ORDER BY m.created_at,m.id"
+        (fun statement ->
+          check_rc db "bind message room" (Sqlite3.bind_int statement 1 room_id);
+          let rec collect messages =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                collect
+                  ({ id = Sqlite3.column_int statement 0;
+                     creator_name = Sqlite3.column_text statement 1;
+                     body_html = Sqlite3.column_text statement 2;
+                     created_at = Sqlite3.column_text statement 3 }
+                  :: messages)
+            | Sqlite3.Rc.DONE -> List.rev messages
+            | error ->
+                failwith
+                  (Printf.sprintf "message lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
+
+let create_message database ~room_id ~creator_id ~body ~client_message_id ~timestamp =
+  Option.iter
+    (fun db ->
+      let run sql =
+        match Sqlite3.exec db sql with
+        | Sqlite3.Rc.OK -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "message transaction failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      let escaped =
+        let output = Buffer.create (String.length body) in
+        String.iter
+          (function
+            | '&' -> Buffer.add_string output "&amp;"
+            | '<' -> Buffer.add_string output "&lt;"
+            | '>' -> Buffer.add_string output "&gt;"
+            | '"' -> Buffer.add_string output "&quot;"
+            | '\'' -> Buffer.add_string output "&#39;"
+            | c -> Buffer.add_char output c)
+          body;
+        Buffer.contents output
+      in
+      let escaped = String.split_on_char '\n' escaped |> String.concat "</div><div>" in
+      run "BEGIN IMMEDIATE";
+      try
+        if not (exists db
+          (Printf.sprintf "SELECT 1 FROM memberships WHERE room_id=%d AND user_id=%d LIMIT 1"
+             room_id creator_id))
+        then failwith "room membership required";
+        with_statement db
+          "INSERT INTO messages(room_id,creator_id,client_message_id,created_at,updated_at) VALUES(?,?,?,?,?)"
+          (fun statement ->
+            List.iteri
+              (fun index value ->
+                check_rc db "bind new message"
+                  (Sqlite3.bind_text statement (index + 1) value))
+              [ string_of_int room_id; string_of_int creator_id; client_message_id;
+                timestamp; timestamp ];
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "message insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        let message_id =
+          with_statement db "SELECT last_insert_rowid()" (fun statement ->
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0
+              | _ -> failwith "message insert returned no row")
+        in
+        with_statement db
+          "INSERT INTO action_text_rich_texts(record_type,record_id,name,body,created_at,updated_at) VALUES('Message',?,'content',?,?,?)"
+          (fun statement ->
+            check_rc db "bind rich text message id"
+              (Sqlite3.bind_int statement 1 message_id);
+            List.iteri
+              (fun index value ->
+                check_rc db "bind rich text message"
+                  (Sqlite3.bind_text statement (index + 2) value))
+              [ "<div>" ^ escaped ^ "</div>"; timestamp; timestamp ];
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "rich text insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        with_statement db
+          "INSERT INTO message_search_index(rowid,body) VALUES(?,?)"
+          (fun statement ->
+            check_rc db "bind message search id"
+              (Sqlite3.bind_int statement 1 message_id);
+            check_rc db "bind message search body"
+              (Sqlite3.bind_text statement 2 body);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "message search insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        run "COMMIT"
+      with error ->
+        (try run "ROLLBACK" with _ -> ());
+        raise error)
+    database
 
 let delete_session database session_id =
   Option.iter

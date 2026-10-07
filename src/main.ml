@@ -163,27 +163,99 @@ let namespaced_form_value form namespace key =
          else None)
   |> Option.value ~default:""
 
+let html_body_to_text body =
+  let output = Buffer.create (String.length body) in
+  let length = String.length body in
+  let rec decode index =
+    if index < length then
+      if body.[index] = '<' then
+        (match String.index_from_opt body index '>' with
+        | None ->
+            Buffer.add_char output body.[index];
+            decode (index + 1)
+        | Some finish ->
+            let tag = String.sub body index (finish - index + 1) |> String.lowercase_ascii in
+            if String.starts_with ~prefix:"<br" tag || String.starts_with ~prefix:"</div" tag
+               || String.starts_with ~prefix:"</p" tag || String.starts_with ~prefix:"</li" tag
+            then Buffer.add_char output '\n';
+            decode (finish + 1))
+      else if body.[index] = '&' then
+        (match String.index_from_opt body index ';' with
+        | Some finish when finish - index <= 10 ->
+            let entity = String.sub body index (finish - index + 1) in
+            let replacement =
+              match entity with
+              | "&amp;" -> Some '&'
+              | "&lt;" -> Some '<'
+              | "&gt;" -> Some '>'
+              | "&quot;" -> Some '"'
+              | "&#39;" | "&apos;" -> Some '\''
+              | "&nbsp;" -> Some ' '
+              | _ -> None
+            in
+            (match replacement with
+            | Some character -> Buffer.add_char output character
+            | None -> Buffer.add_string output entity);
+            decode (finish + 1)
+        | _ ->
+            Buffer.add_char output body.[index];
+            decode (index + 1))
+      else (
+        Buffer.add_char output body.[index];
+        decode (index + 1))
+  in
+  decode 0;
+  Buffer.contents output
+
+let safe_message_body body =
+  body |> html_body_to_text |> html_escape |> String.split_on_char '\n'
+  |> String.concat "<br>"
+
 let room_page (user : Database.user) (rooms : Database.room list)
-    (current : Database.room) =
+    (current : Database.room) csrf (messages : Database.message list) =
   let links =
     rooms
-    |> List.map (fun room ->
+    |> List.map (fun (room : Database.room) ->
            "<li><a href=\"/rooms/" ^ string_of_int room.Database.id ^ "\">"
            ^ html_escape room.Database.name ^ "</a></li>")
     |> String.concat ""
   in
   "<!doctype html><html><head><meta charset=\"utf-8\"><title>"
   ^ html_escape current.Database.name
-  ^ " · Campfire</title></head><body><nav><a href=\"/\">Campfire</a><p>"
+  ^ " · Campfire</title><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ html_escape csrf
+  ^ "\"></head><body><nav><a href=\"/\">Campfire</a><p>"
   ^ html_escape user.Database.name ^ "</p><ul>" ^ links
   ^ "</ul></nav><main><h1>"
   ^ html_escape current.Database.name
-  ^ "</h1><section aria-label=\"Messages\"><p>Messages in this room are not rendered by this OxCaml milestone yet.</p></section></main></body></html>"
+  ^ "</h1><section aria-label=\"Messages\"><ol>"
+  ^ (messages
+    |> List.map (fun (message : Database.message) ->
+           "<li><article><header><strong>" ^ html_escape message.Database.creator_name
+           ^ "</strong> <time>" ^ html_escape message.Database.created_at
+           ^ "</time></header><div class=\"message-body\">"
+           ^ safe_message_body message.Database.body_html ^ "</div></article></li>")
+    |> String.concat "")
+  ^ "</ol></section><form action=\"/rooms/" ^ string_of_int current.Database.id
+  ^ "/messages\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+  ^ html_escape csrf
+  ^ "\"><label>Write a message<textarea name=\"message[body]\" required maxlength=\"10000\"></textarea></label><button type=\"submit\">Send</button></form></main></body></html>"
 
 let room_id_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; id ] -> int_of_string_opt id
   | _ -> None
+
+let message_room_id_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; id; "messages" ] -> int_of_string_opt id
+  | _ -> None
+
+let create_message_id () =
+  let hex = Rails_crypto.random_bytes 16 |> Rails_crypto.hex in
+  String.sub hex 0 8 ^ "-" ^ String.sub hex 8 4 ^ "-"
+  ^ String.sub hex 12 4 ^ "-" ^ String.sub hex 16 4 ^ "-"
+  ^ String.sub hex 20 12
 
 let valid_origin headers =
   let origin = Cohttp.Header.get headers "origin" in
@@ -328,6 +400,41 @@ let create_first_run database remote_ip secret headers body =
              ~error:"Campfire could not be set up with those details."
              session.Session.csrf_form_token)
 
+let submit_message database secret headers room_id body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  let path = "/rooms/" ^ string_of_int room_id ^ "/messages" in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"POST" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (match
+           Database.find_room_for_user database identity.Database.user.id room_id
+         with
+        | None -> response `Not_found "Room not found or inaccessible"
+        | Some _ ->
+            let content = namespaced_form_value form "message" "body" in
+            if String.trim content = "" || String.length content > 10_000 then
+              response `Unprocessable_entity "Message must contain 1–10000 bytes"
+            else
+              try
+                Database.create_message database ~room_id
+                  ~creator_id:identity.Database.user.id ~body:content
+                  ~client_message_id:(create_message_id ())
+                  ~timestamp:(timestamp_now ());
+                redirect ("/rooms/" ^ string_of_int room_id)
+              with _ -> response `Unprocessable_entity "Message could not be saved")
+
 let logout database secret headers body =
   let session = load_session secret headers in
   let form = parse_form body in
@@ -411,6 +518,18 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
             redirect
               ~headers:(attach_session_cookie (Cohttp.Header.init ()) ~secret session)
               "/first_run")
+  | `POST, message_path when message_room_id_of_path message_path <> None ->
+      (match (secret_key_base (), message_room_id_of_path message_path) with
+      | Some secret, Some room_id ->
+          (try
+             let request_body = request_body body in
+             submit_message database secret headers room_id request_body
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid message request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
   | `GET, room_path ->
       (match (secret_key_base (), room_id_of_path room_path) with
       | Some secret, Some room_id ->
@@ -424,7 +543,8 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
                   html_with_session ~secret session `OK
                     (room_page identity.Database.user
                        (Database.rooms_for_user database identity.Database.user.id)
-                       room)))
+                       room session.Session.csrf_form_token
+                       (Database.messages_for_room database room.Database.id))))
       | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | _, None -> response `Not_found "Not found")
   | `POST, "/session" ->
