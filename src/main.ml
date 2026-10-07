@@ -222,7 +222,8 @@ let safe_message_body body =
   |> String.concat "<br>"
 
 let room_page (user : Database.user) (rooms : Database.room list)
-    (current : Database.room) csrf (messages : Database.message list) =
+    (current : Database.room) csrf (messages : Database.message list)
+    ~older_messages ~newer_messages =
   let links =
     rooms
     |> List.map (fun (room : Database.room) ->
@@ -241,12 +242,24 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ "</h1><section aria-label=\"Messages\"><ol>"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
-           "<li><article><header><strong>" ^ html_escape message.Database.creator_name
+           "<li id=\"message-" ^ string_of_int message.Database.id
+           ^ "\"><article><header><strong>" ^ html_escape message.Database.creator_name
            ^ "</strong> <time>" ^ html_escape message.Database.created_at
            ^ "</time></header><div class=\"message-body\">"
            ^ safe_message_body message.Database.body_html ^ "</div></article></li>")
     |> String.concat "")
-  ^ "</ol></section><form action=\"/rooms/" ^ string_of_int current.Database.id
+  ^ "</ol></section><nav aria-label=\"Message history\">"
+  ^ (match (older_messages, messages) with
+    | true, first :: _ ->
+        "<a rel=\"prev\" href=\"/rooms/" ^ string_of_int current.Database.id
+        ^ "/messages?before=" ^ string_of_int first.Database.id ^ "\">Older messages</a>"
+    | _ -> "")
+  ^ (match (newer_messages, List.rev messages) with
+    | true, latest :: _ ->
+        "<a rel=\"next\" href=\"/rooms/" ^ string_of_int current.Database.id
+        ^ "/messages?after=" ^ string_of_int latest.Database.id ^ "\">Newer messages</a>"
+    | _ -> "")
+  ^ "</nav><form action=\"/rooms/" ^ string_of_int current.Database.id
   ^ "/messages\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
   ^ html_escape csrf
   ^ "\"><label>Write a message<textarea name=\"message[body]\" required maxlength=\"10000\"></textarea></label><button type=\"submit\">Send</button></form></main></body></html>"
@@ -254,6 +267,21 @@ let room_page (user : Database.user) (rooms : Database.room list)
 let room_id_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; id ] -> int_of_string_opt id
+  | _ -> None
+
+let room_message_collection_id path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; id; "messages" ] -> int_of_string_opt id
+  | _ -> None
+
+let room_at_message path =
+  match String.split_on_char '/' path with
+  | [ ""; "rooms"; room_id; message_id ]
+    when String.starts_with ~prefix:"@" message_id ->
+      Option.bind (int_of_string_opt room_id) (fun room_id ->
+          Option.map (fun message_id -> (room_id, message_id))
+            (int_of_string_opt
+               (String.sub message_id 1 (String.length message_id - 1))))
   | _ -> None
 
 let message_room_id_of_path path =
@@ -313,6 +341,7 @@ let search_page (user : Database.user) csrf query recents results =
     |> List.map (fun (result : Database.search_result) ->
            let message = result.Database.message in
            "<li><article><a href=\"/rooms/" ^ string_of_int result.Database.room_id
+           ^ "/@" ^ string_of_int message.Database.id
            ^ "\">" ^ html_escape result.Database.room_name ^ "</a><header><strong>"
            ^ html_escape message.Database.creator_name ^ "</strong> <time>"
            ^ html_escape message.Database.created_at ^ "</time></header><div>"
@@ -598,6 +627,31 @@ let logout database secret headers body =
     in
     response ~headers `Found "")
 
+let room_response database secret headers room_id messages ~older_messages
+    ~newer_messages =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      (match Database.find_room_for_user database identity.Database.user.id room_id with
+      | None -> response `Not_found "Room not found or inaccessible"
+      | Some room ->
+          let session = load_session secret headers in
+          let older_messages, newer_messages =
+            match messages with
+            | [] -> (false, false)
+            | first :: _ ->
+                let last = List.hd (List.rev messages) in
+                ( (older_messages
+                  && Database.has_messages_before database room_id first.Database.id),
+                  (newer_messages
+                  && Database.has_messages_after database room_id last.Database.id) )
+          in
+          html_with_session ~secret session `OK
+            (room_page identity.Database.user
+               (Database.rooms_for_user database identity.Database.user.id)
+               room session.Session.csrf_form_token messages ~older_messages
+               ~newer_messages))
+
 let serve_request ~database ~jobs_database ~remote_ip request body =
   let path = path_of_request request in
   let headers = Cohttp.Request.headers request in
@@ -682,6 +736,57 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
             redirect
               ~headers:(attach_session_cookie (Cohttp.Header.init ()) ~secret session)
               "/first_run")
+  | `GET, collection_path
+    when room_message_collection_id collection_path <> None ->
+      (match (secret_key_base (), room_message_collection_id collection_path) with
+      | Some secret, Some room_id ->
+          (match current_identity database secret headers with
+          | None -> redirect "/session/new"
+          | Some identity ->
+              (match Database.find_room_for_user database identity.Database.user.id room_id with
+              | None -> response `Not_found "Room not found or inaccessible"
+              | Some _ ->
+                  let params = query_parameters request in
+                  let before = List.assoc_opt "before" params in
+                  let after = List.assoc_opt "after" params in
+                  let parse_anchor = function
+                    | None -> `Absent
+                    | Some value ->
+                        (match int_of_string_opt value with
+                        | Some id -> `Value id
+                        | None -> `Invalid)
+                  in
+                  (try
+                     match (parse_anchor before, parse_anchor after) with
+                  | `Invalid, _ | _, `Invalid -> response `Bad_request "Invalid message cursor"
+                  | (`Value _ as before), _ ->
+                      let before = match before with `Value id -> Some id | _ -> None in
+                      let messages = Database.messages_for_room ?before database room_id in
+                      room_response database secret headers room_id messages
+                        ~older_messages:true ~newer_messages:true
+                  | `Absent, (`Value _ as after) ->
+                      let after = match after with `Value id -> Some id | _ -> None in
+                      let messages = Database.messages_for_room ?after database room_id in
+                      room_response database secret headers room_id messages
+                        ~older_messages:true ~newer_messages:true
+                  | `Absent, `Absent ->
+                      let messages = Database.messages_for_room database room_id in
+                      room_response database secret headers room_id messages
+                        ~older_messages:true ~newer_messages:true
+                   with Database.Message_not_found ->
+                     response `Not_found "Message not found in room")))
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | `GET, at_message_path when room_at_message at_message_path <> None ->
+      (match (secret_key_base (), room_at_message at_message_path) with
+      | Some secret, Some (room_id, message_id) ->
+          let messages =
+            Database.messages_for_room ~around:message_id database room_id
+          in
+          room_response database secret headers room_id messages
+            ~older_messages:true ~newer_messages:true
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
   | `POST, message_path when message_room_id_of_path message_path <> None ->
       (match (secret_key_base (), message_room_id_of_path message_path) with
       | Some secret, Some room_id ->
@@ -697,18 +802,9 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
   | `GET, room_path ->
       (match (secret_key_base (), room_id_of_path room_path) with
       | Some secret, Some room_id ->
-          (match current_identity database secret headers with
-          | None -> redirect "/session/new"
-          | Some identity ->
-              (match Database.find_room_for_user database identity.Database.user.id room_id with
-              | None -> response `Not_found "Room not found or inaccessible"
-              | Some room ->
-                  let session = load_session secret headers in
-                  html_with_session ~secret session `OK
-                    (room_page identity.Database.user
-                       (Database.rooms_for_user database identity.Database.user.id)
-                       room session.Session.csrf_form_token
-                       (Database.messages_for_room database room.Database.id))))
+          let messages = Database.messages_for_room database room_id in
+          room_response database secret headers room_id messages
+            ~older_messages:true ~newer_messages:true
       | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | _, None -> response `Not_found "Not found")
   | `POST, "/session" ->

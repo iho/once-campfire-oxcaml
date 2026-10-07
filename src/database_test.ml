@@ -175,6 +175,39 @@ let () =
         (Database.with_statement setup_db "SELECT count(*) FROM messages" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));
+      for index = 2 to 42 do
+        Database.create_message (Some setup_db) ~room_id:1 ~creator_id:user_id
+          ~body:(Printf.sprintf "page message %02d" index)
+          ~client_message_id:(Printf.sprintf "page-%012d" index)
+          ~timestamp:(Printf.sprintf "2026-10-07 12:02:%02d.000" index)
+      done;
+      let latest = Database.messages_for_room (Some setup_db) 1 in
+      check "room latest page is capped at forty" 40 (List.length latest);
+      check "room latest page is chronological" (3, 42)
+        ((List.hd latest).Database.id, (List.hd (List.rev latest)).Database.id);
+      check "before cursor returns older chronological page" (21, 1, 21)
+        (let page =
+           Database.messages_for_room ~before:22 (Some setup_db) 1
+         in
+         (List.length page, (List.hd page).Database.id,
+          (List.hd (List.rev page)).Database.id));
+      check "after cursor returns newer chronological page" (20, 23, 42)
+        (let page = Database.messages_for_room ~after:22 (Some setup_db) 1 in
+         (List.length page, (List.hd page).Database.id,
+          (List.hd (List.rev page)).Database.id));
+      check "permalink page surrounds its pivot" (42, 1, 42)
+        (let page = Database.messages_for_room ~around:22 (Some setup_db) 1 in
+         (List.length page, (List.hd page).Database.id,
+          (List.hd (List.rev page)).Database.id));
+      check "cursor navigation detects adjacent pages" true
+        (Database.has_messages_before (Some setup_db) 1 3
+        && Database.has_messages_after (Some setup_db) 1 22
+        && not (Database.has_messages_before (Some setup_db) 1 1)
+        && not (Database.has_messages_after (Some setup_db) 1 42));
+      (try
+         ignore (Database.messages_for_room ~before:999 (Some setup_db) 1);
+         failwith "missing pagination cursor unexpectedly succeeded"
+       with Database.Message_not_found -> ());
       check "first-run grants creator room membership" 1
         (Database.with_statement setup_db
            "SELECT count(*) FROM memberships WHERE user_id=? AND room_id=(SELECT id FROM rooms)"

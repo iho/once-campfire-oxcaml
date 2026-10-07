@@ -12,6 +12,8 @@ type room = { id : int; name : string; kind : string }
 type message = { id : int; creator_name : string; body_html : string; created_at : string }
 type search_result = { message : message; room_id : int; room_name : string }
 
+exception Message_not_found
+
 let path storage_root =
   Filename.concat (Filename.concat storage_root "db") "production.sqlite3"
 
@@ -227,29 +229,127 @@ let find_room_for_user database user_id room_id =
   rooms_for_user database user_id
   |> List.find_opt (fun (room : room) -> room.id = room_id)
 
-let messages_for_room database room_id =
+let messages_for_room ?before ?after ?around database room_id =
   Option.fold ~none:[]
     ~some:(fun db ->
-      with_statement db
-        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=? ORDER BY m.created_at DESC,m.id DESC LIMIT 40"
-        (fun statement ->
-          check_rc db "bind message room" (Sqlite3.bind_int statement 1 room_id);
-          let rec collect messages =
+      let select =
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=?"
+      in
+      let pivot message_id =
+        with_statement db
+          "SELECT created_at FROM messages WHERE room_id=? AND id=? LIMIT 1"
+          (fun statement ->
+            check_rc db "bind message pivot room"
+              (Sqlite3.bind_int statement 1 room_id);
+            check_rc db "bind message pivot id"
+              (Sqlite3.bind_int statement 2 message_id);
             match Sqlite3.step statement with
-            | Sqlite3.Rc.ROW ->
-                collect
-                  ({ id = Sqlite3.column_int statement 0;
-                     creator_name = Sqlite3.column_text statement 1;
-                     body_html = Sqlite3.column_text statement 2;
-                     created_at = Sqlite3.column_text statement 3 }
-                  :: messages)
-            | Sqlite3.Rc.DONE -> List.rev messages
+            | Sqlite3.Rc.ROW -> Some (Sqlite3.column_text statement 0)
+            | Sqlite3.Rc.DONE -> None
             | error ->
                 failwith
-                  (Printf.sprintf "message lookup failed (%s): %s"
-                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
-          in
-          collect [] |> List.rev))
+                  (Printf.sprintf "message pivot lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)))
+      in
+      let pivot_message message_id =
+        with_statement db
+          (select ^ " AND m.id=? LIMIT 1")
+          (fun statement ->
+            check_rc db "bind message pivot room"
+              (Sqlite3.bind_int statement 1 room_id);
+            check_rc db "bind message pivot id"
+              (Sqlite3.bind_int statement 2 message_id);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                Some
+                  { id = Sqlite3.column_int statement 0;
+                    creator_name = Sqlite3.column_text statement 1;
+                    body_html = Sqlite3.column_text statement 2;
+                    created_at = Sqlite3.column_text statement 3 }
+            | Sqlite3.Rc.DONE -> None
+            | error ->
+                failwith
+                  (Printf.sprintf "message pivot lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)))
+      in
+      let query ?timestamp predicate order =
+        with_statement db (select ^ predicate ^ " ORDER BY m.created_at " ^ order
+                           ^ ",m.id " ^ order ^ " LIMIT 40")
+          (fun statement ->
+            check_rc db "bind message room" (Sqlite3.bind_int statement 1 room_id);
+            Option.iter
+              (fun timestamp ->
+                check_rc db "bind message pivot timestamp"
+                  (Sqlite3.bind_text statement 2 timestamp))
+              timestamp;
+            let rec collect messages =
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW ->
+                  collect
+                    ({ id = Sqlite3.column_int statement 0;
+                       creator_name = Sqlite3.column_text statement 1;
+                       body_html = Sqlite3.column_text statement 2;
+                       created_at = Sqlite3.column_text statement 3 }
+                    :: messages)
+              | Sqlite3.Rc.DONE -> List.rev messages
+              | error ->
+                  failwith
+                    (Printf.sprintf "message lookup failed (%s): %s"
+                       (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+            in
+            let messages = collect [] in
+            if order = "DESC" then List.rev messages else messages)
+      in
+      let latest () = query "" "DESC" in
+      match around with
+      | Some message_id ->
+          (match (pivot message_id, pivot_message message_id) with
+          | Some timestamp, Some message ->
+              query ~timestamp " AND m.created_at<?" "DESC"
+              @ [ message ]
+              @ query ~timestamp " AND m.created_at>?" "ASC"
+          | _ -> latest ())
+      | None ->
+          (match (before, after) with
+          | Some message_id, _ ->
+              (match pivot message_id with
+              | Some timestamp -> query ~timestamp " AND m.created_at<?" "DESC"
+              | None -> raise Message_not_found)
+          | _, Some message_id ->
+              (match pivot message_id with
+              | Some timestamp -> query ~timestamp " AND m.created_at>?" "ASC"
+              | None -> raise Message_not_found)
+          | None, None -> latest ()))
+    database
+
+let has_messages_before database room_id message_id =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      with_statement db
+        "SELECT EXISTS(SELECT 1 FROM messages p JOIN messages m ON m.room_id=p.room_id AND m.created_at<p.created_at WHERE p.room_id=? AND p.id=?)"
+        (fun statement ->
+          check_rc db "bind older-message room"
+            (Sqlite3.bind_int statement 1 room_id);
+          check_rc db "bind older-message pivot"
+            (Sqlite3.bind_int statement 2 message_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0 <> 0
+          | _ -> false))
+    database
+
+let has_messages_after database room_id message_id =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      with_statement db
+        "SELECT EXISTS(SELECT 1 FROM messages p JOIN messages m ON m.room_id=p.room_id AND m.created_at>p.created_at WHERE p.room_id=? AND p.id=?)"
+        (fun statement ->
+          check_rc db "bind newer-message room"
+            (Sqlite3.bind_int statement 1 room_id);
+          check_rc db "bind newer-message pivot"
+            (Sqlite3.bind_int statement 2 message_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0 <> 0
+          | _ -> false))
     database
 
 let create_message database ~room_id ~creator_id ~body ~client_message_id ~timestamp =
