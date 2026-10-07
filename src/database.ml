@@ -8,9 +8,12 @@ type user = {
 }
 
 type profile = { id : int; name : string; email_address : string; bio : string }
+type avatar_user = { id : int; name : string; role : int }
+type avatar_blob = { key : string; content_type : string }
 
 type identity = { session_id : int; user : user }
 type room = { id : int; name : string; kind : string; creator_id : int }
+type sidebar_room = { room : room; unread : bool }
 type user_option = { id : int; name : string }
 type message = {
   id : int;
@@ -276,6 +279,41 @@ let find_profile database user_id =
                 (Printf.sprintf "profile lookup failed (%s): %s"
                    (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
 
+let find_avatar_user database user_id =
+  Option.bind database (fun db ->
+      with_statement db "SELECT id,name,role FROM users WHERE id=? LIMIT 1"
+        (fun statement ->
+          check_rc db "bind avatar user" (Sqlite3.bind_int statement 1 user_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW ->
+              Some
+                { id = Sqlite3.column_int statement 0;
+                  name = Sqlite3.column_text statement 1;
+                  role = Sqlite3.column_int statement 2 }
+          | Sqlite3.Rc.DONE -> None
+          | error ->
+              failwith
+                (Printf.sprintf "avatar user lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let find_avatar_blob database user_id =
+  Option.bind database (fun db ->
+      with_statement db
+        "SELECT b.key,COALESCE(b.content_type,'application/octet-stream') FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id=a.blob_id WHERE a.record_type='User' AND a.record_id=? AND a.name='avatar' LIMIT 1"
+        (fun statement ->
+          check_rc db "bind avatar attachment user"
+            (Sqlite3.bind_int statement 1 user_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW ->
+              Some
+                { key = Sqlite3.column_text statement 0;
+                  content_type = Sqlite3.column_text statement 1 }
+          | Sqlite3.Rc.DONE -> None
+          | error ->
+              failwith
+                (Printf.sprintf "avatar attachment lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
 let update_profile database ~user_id ~name ~email_address ~password_digest ~bio
     ~timestamp =
   Option.fold ~none:false
@@ -394,6 +432,37 @@ let rooms_for_user database user_id =
             | error ->
                 failwith
                   (Printf.sprintf "room lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
+
+let sidebar_rooms database user_id =
+  Option.fold ~none:[]
+    ~some:(fun db ->
+      with_statement db
+        "SELECT r.id,CASE WHEN r.type='Rooms::Direct' THEN COALESCE((SELECT group_concat(name, ', ') FROM (SELECT u.name AS name FROM memberships dm JOIN users u ON u.id=dm.user_id WHERE dm.room_id=r.id AND dm.user_id<>? ORDER BY lower(u.name))), 'Direct conversation') ELSE COALESCE(r.name,'') END,r.type,r.creator_id,(m.unread_at IS NOT NULL) FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? AND COALESCE(m.involvement,'')<>'invisible' ORDER BY CASE WHEN r.type='Rooms::Direct' THEN 0 ELSE 1 END,CASE WHEN r.type='Rooms::Direct' THEN r.updated_at END DESC,LOWER(COALESCE(r.name,''))"
+        (fun statement ->
+          check_rc db "bind sidebar direct-room display user"
+            (Sqlite3.bind_int statement 1 user_id);
+          check_rc db "bind sidebar membership user"
+            (Sqlite3.bind_int statement 2 user_id);
+          let rec collect rooms =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                let room =
+                  { id = Sqlite3.column_int statement 0;
+                    name = Sqlite3.column_text statement 1;
+                    kind = Sqlite3.column_text statement 2;
+                    creator_id = Sqlite3.column_int statement 3 }
+                in
+                collect
+                  ({ room; unread = Sqlite3.column_int statement 4 <> 0 }
+                  :: rooms)
+            | Sqlite3.Rc.DONE -> List.rev rooms
+            | error ->
+                failwith
+                  (Printf.sprintf "sidebar room lookup failed (%s): %s"
                      (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
           in
           collect []))

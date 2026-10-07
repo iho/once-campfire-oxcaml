@@ -39,7 +39,12 @@ membership-scoped room pages, create public rooms for all active users and priva
 for selected members, rename/delete shared rooms, convert open/closed rooms while revising
 memberships transactionally, create/reuse participant-scoped direct conversations, and post
 plain-text messages stored in Rails Action Text and FTS
-tables. Authors and administrators can edit or delete text messages, with Action Text and
+tables. The authenticated `/users/me/sidebar` endpoint renders visible shared rooms and
+direct conversations from Rails memberships, including unread indicators. Room pages expose
+benchmark message IDs and link a small native stylesheet for the shared HTTP preflight.
+Room and sidebar responses also expose Rails-signed Turbo stream names; the Cable transport
+is not implemented yet.
+Authors and administrators can edit or delete text messages, with Action Text and
 FTS updated transactionally; edit/delete requests for messages with attachments are rejected
 until attachment storage is supported. Join-code invitations create member accounts, grant access to existing public
 rooms, and start a session. Room creation honors the account's administrator-only setting.
@@ -52,8 +57,10 @@ Direct conversations are created or reused by exact participant set and default 
 members about every message; any participant can delete a direct conversation. Room deletion
 cleans text messages, boosts and search entries transactionally, but is rejected when the room
 contains attachments because storage cleanup is not implemented.
-Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
-cookie handling are not implemented yet. Logout
+Signed avatar URLs verify Rails Active Record IDs and return a local stored image or an
+initials SVG fallback. Avatar upload and optimized variants, rich formatting, message
+attachments, real-time delivery, and forwarded-HTTPS cookie handling are not implemented
+yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),
 leaving the Rails database schema untouched. The app uses Cohttp's Eio HTTP/1 server; direct
@@ -66,7 +73,10 @@ Run the native SQLite, bcrypt and Rails cookie/CSRF checks with
 
 No Rails compatibility or production-readiness claim is made yet. This is an early port:
 account/session authentication and the authenticated room/message feature set are partial,
-and production-database verification remains incomplete. See
+and production-database verification remains incomplete. The shared benchmark's canonical
+populated-seed preflight and Action Cable suite have not yet been run; Action Cable is not
+implemented.
+See
 [verification status](plans/contracts.md).
 
 ## License

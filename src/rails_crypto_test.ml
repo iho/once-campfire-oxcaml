@@ -19,6 +19,34 @@ let () =
     (Rails_crypto.verify_cookie ~secret ~name:"session_token" signed_cookie);
   check "signed cookie purpose is bound" None
     (Rails_crypto.verify_cookie ~secret ~name:"another_cookie" signed_cookie);
+  let avatar_id =
+    "eyJfcmFpbHMiOnsiZGF0YSI6MSwicHVyIjoidXNlci9hdmF0YXIifX0--023b16424a00933214f527b2dbc6cb54ffa966a5b4fa3375c0678891f4e168e1"
+  in
+  check "Rails Active Record avatar signed ID" (Some 1)
+    (Rails_crypto.verify_user_avatar_id ~secret avatar_id);
+  check "avatar signed ID rejects another purpose" None
+    (Rails_crypto.verify_user_avatar_id ~secret
+       "eyJfcmFpbHMiOnsiZGF0YSI6MSwicHVyIjoidXNlciJ9fQ--ca0a5ac7b8763056751763399933da27f8551acad70d40c9be532b8b31e16c1b");
+  check "avatar signed ID accepts the Rails legacy SHA1 verifier" (Some 1)
+    (Rails_crypto.verify_user_avatar_id ~secret
+       "eyJfcmFpbHMiOnsiZGF0YSI6MSwicHVyIjoidXNlci9hdmF0YXIifX0=--48e3908278ac645d127bf75d84b238052a8d2e46");
+  check "avatar signed ID accepts string user IDs" (Some 7)
+    (Rails_crypto.verify_user_avatar_id ~secret
+       "eyJfcmFpbHMiOnsiZGF0YSI6IjciLCJwdXIiOiJ1c2VyL2F2YXRhciJ9fQ--fc248b0d4e94a913880767c1b0b95bfe71ce692372e175f7931ff31461ba7045");
+  check "avatar signed ID rejects tampering" None
+    (Rails_crypto.verify_user_avatar_id ~secret
+       (String.sub avatar_id 0 (String.length avatar_id - 1) ^ "0"));
+  check "Rails Turbo room stream signing"
+    "IloybGtPaTh2WTJGdGNHWnBjbVV2VW05dmJYTTZPazl3Wlc0dk1ROm1lc3NhZ2VzIg==--6ff497f9ec2f68f7ec64a5aee2fe25bd5ca8e2647ff82db8e211aabd83382b8b"
+    (Rails_crypto.sign_turbo_stream_name ~secret
+       "Z2lkOi8vY2FtcGZpcmUvUm9vbXM6Ok9wZW4vMQ:messages");
+  check "Rails Turbo global rooms stream signing"
+    "InJvb21zIg==--60a2ff565fb2226042c779b5711156db1d1cc48f89e6f59c94e4bf1da3f0945c"
+    (Rails_crypto.sign_turbo_stream_name ~secret "rooms");
+  check "Rails Turbo user rooms stream signing"
+    "IloybGtPaTh2WTJGdGNHWnBjbVV2VlhObGNpOHg6cm9vbXMi--1cc07be3a8b410a4bbfe4ca0988a833987c1c5000f804159f99177c56f9515f8"
+    (Rails_crypto.sign_turbo_stream_name ~secret
+       "Z2lkOi8vY2FtcGZpcmUvVXNlci8x:rooms");
   let session =
     `Assoc
       [ ("session_id", `String "6d3a2b1c0f9e8d7c6b5a493827161504");

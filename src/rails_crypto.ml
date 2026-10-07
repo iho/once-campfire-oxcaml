@@ -229,6 +229,54 @@ let verify_cookie ~secret ~name raw =
             Option.bind (base64_decode payload) (fun envelope ->
                 decode_envelope ~name envelope)))
 
+let verify_user_avatar_id ~secret raw =
+  Option.bind (split_signature raw) (fun (payload, signature) ->
+      let signing_key = derive_key secret "active_record/signed_id" 64 in
+      let valid_signature =
+        [ 2; 1 ]
+        |> List.exists (fun algorithm ->
+               let expected = hmac algorithm signing_key payload |> hex in
+               constant_time_equal signature expected)
+      in
+      if not valid_signature then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `Assoc [ ("_rails", `Assoc fields) ] ->
+                  let field key = List.assoc_opt key fields in
+                  (match (field "data", field "pur", field "exp") with
+                  | Some (`Int id), Some (`String "user/avatar"), expiry
+                    when id > 0 ->
+                      let expiry =
+                        match expiry with
+                        | Some (`String value) -> Some value
+                        | _ -> None
+                      in
+                      if Option.fold ~none:false
+                           ~some:(fun value -> value <= utc_now ()) expiry
+                      then None
+                      else Some id
+                  | Some (`String id), Some (`String "user/avatar"), expiry ->
+                      let expiry =
+                        match expiry with
+                        | Some (`String value) -> Some value
+                        | _ -> None
+                      in
+                      if Option.fold ~none:false
+                           ~some:(fun value -> value <= utc_now ()) expiry
+                      then None
+                      else int_of_string_opt id
+                  | _ -> None)
+              | _ -> None
+            with _ -> None))
+
+let sign_turbo_stream_name ~secret stream_name =
+  let payload = Yojson.Basic.to_string (`String stream_name) |> base64_encode in
+  let key = derive_key secret "turbo/signed_stream_verifier_key" 64 in
+  let signature = hmac 2 key payload |> hex in
+  payload ^ "--" ^ signature
+
 let encrypt_cookie ~secret ~name ?expires_at ?nonce value =
   let nonce = Option.value nonce ~default:(random_bytes 12) in
   if String.length nonce <> 12 then invalid_arg "Rails cookie nonce must be 12 bytes";

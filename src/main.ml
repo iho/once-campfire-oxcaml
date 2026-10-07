@@ -255,7 +255,7 @@ let message_edit_form (user : Database.user) csrf room_id
 
 let room_page (user : Database.user) (rooms : Database.room list)
     (current : Database.room) csrf (messages : Database.message list)
-    ~older_messages ~newer_messages =
+    ~older_messages ~newer_messages ~room_stream =
   let links =
     rooms
     |> List.map (fun (room : Database.room) ->
@@ -265,7 +265,7 @@ let room_page (user : Database.user) (rooms : Database.room list)
   in
   "<!doctype html><html><head><meta charset=\"utf-8\"><title>"
   ^ html_escape current.Database.name
-  ^ " · Campfire</title><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ " · Campfire</title><link rel=\"stylesheet\" href=\"/assets/campfire.css\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
   ^ html_escape csrf
   ^ "\"></head><body><nav><a href=\"/\">Campfire</a> <a href=\"/searches\">Search</a><p>"
   ^ "<a href=\"/users/me/profile\">" ^ html_escape user.Database.name ^ "</a>"
@@ -312,13 +312,16 @@ let room_page (user : Database.user) (rooms : Database.room list)
              else ""
            in
            "<li id=\"message-" ^ string_of_int message.Database.id
+           ^ "\" data-message-id=\"" ^ string_of_int message.Database.id
            ^ "\"><article><header><strong>" ^ html_escape message.Database.creator_name
            ^ "</strong> <time>" ^ html_escape message.Database.created_at
            ^ "</time></header><div class=\"message-body\">"
            ^ safe_message_body message.Database.body_html ^ "</div>" ^ actions
            ^ "</article></li>")
     |> String.concat "")
-  ^ "</ol></section><nav aria-label=\"Message history\">"
+  ^ "</ol></section><turbo-cable-stream-source channel=\"RoomMessagesChannel\" signed-stream-name=\""
+  ^ html_escape room_stream
+  ^ "\"></turbo-cable-stream-source><nav aria-label=\"Message history\">"
   ^ (match (older_messages, messages) with
     | true, first :: _ ->
         "<a rel=\"prev\" href=\"/rooms/" ^ string_of_int current.Database.id
@@ -342,6 +345,11 @@ let room_id_of_path path =
 let direct_room_id_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "rooms"; "directs"; id ] -> int_of_string_opt id
+  | _ -> None
+
+let avatar_token_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "users"; token; "avatar" ] when token <> "" -> Some token
   | _ -> None
 
 let room_message_collection_id path =
@@ -449,7 +457,8 @@ let search_page (user : Database.user) csrf query recents results =
     results
     |> List.map (fun (result : Database.search_result) ->
            let message = result.Database.message in
-           "<li><article><a href=\"/rooms/" ^ string_of_int result.Database.room_id
+           "<li data-message-id=\"" ^ string_of_int message.Database.id
+           ^ "\"><article><a href=\"/rooms/" ^ string_of_int result.Database.room_id
            ^ "/@" ^ string_of_int message.Database.id
            ^ "\">" ^ html_escape result.Database.room_name ^ "</a><header><strong>"
            ^ html_escape message.Database.creator_name ^ "</strong> <time>"
@@ -1062,11 +1071,139 @@ let room_response database secret headers room_id messages ~older_messages
                   (newer_messages
                   && Database.has_messages_after database room_id last.Database.id) )
           in
+          let room_gid =
+            Rails_crypto.base64url_encode
+              ("gid://campfire/" ^ room.Database.kind ^ "/"
+             ^ string_of_int room.Database.id)
+          in
+          let room_stream =
+            Rails_crypto.sign_turbo_stream_name ~secret
+              (room_gid ^ ":messages")
+          in
           html_with_session ~secret session `OK
             (room_page identity.Database.user
                (Database.rooms_for_user database identity.Database.user.id)
                room session.Session.csrf_form_token messages ~older_messages
-               ~newer_messages))
+               ~newer_messages ~room_stream))
+
+let sidebar_page database secret headers =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      let session = load_session secret headers in
+      let rooms = Database.sidebar_rooms database identity.Database.user.id in
+      let render_room direct (entry : Database.sidebar_room) =
+        let room = entry.Database.room in
+        let direct_class = if direct then " direct" else " room" in
+        let unread_class = if entry.Database.unread then " unread" else "" in
+        "<a id=\"room_" ^ string_of_int room.Database.id
+        ^ "_list\" class=\"btn align-center gap txt-nowrap" ^ direct_class
+        ^ unread_class ^ "\" href=\"/rooms/" ^ string_of_int room.Database.id
+        ^ "\"><span class=\"overflow-ellipsis\">"
+        ^ html_escape room.Database.name ^ "</span></a>"
+      in
+      let directs, shared =
+        List.partition
+          (fun (entry : Database.sidebar_room) ->
+            entry.Database.room.Database.kind = "Rooms::Direct")
+          rooms
+      in
+      let render_list direct values =
+        values |> List.map (render_room direct) |> String.concat ""
+      in
+      let global_stream = Rails_crypto.sign_turbo_stream_name ~secret "rooms" in
+      let user_gid =
+        Rails_crypto.base64url_encode
+          ("gid://campfire/User/" ^ string_of_int identity.Database.user.id)
+      in
+      let user_stream =
+        Rails_crypto.sign_turbo_stream_name ~secret (user_gid ^ ":rooms")
+      in
+      html_with_session ~secret session `OK
+        ("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+        ^ html_escape session.Session.csrf_form_token
+        ^ "\"></head><body><turbo-frame id=\"user_sidebar\"><turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\""
+        ^ html_escape global_stream
+        ^ "\"></turbo-cable-stream-source><turbo-cable-stream-source channel=\"Turbo::StreamsChannel\" signed-stream-name=\""
+        ^ html_escape user_stream
+        ^ "\"></turbo-cable-stream-source><div class=\"sidebar__container\"><section class=\"directs\"><a class=\"direct direct__new\" href=\"/rooms/directs/new\">Ping</a><div id=\"direct_rooms\" contents data-controller=\"sorted-list\">"
+        ^ render_list true directs
+        ^ "</div></section><section class=\"rooms\"><div id=\"shared_rooms\" contents data-controller=\"sorted-list\">"
+        ^ render_list false shared
+        ^ "</div></section></div><div class=\"sidebar__tools\"><a href=\"/users/me/profile\">"
+        ^ html_escape identity.Database.user.name
+        ^ "</a></div></turbo-frame></body></html>")
+
+let avatar_svg name =
+  let initials =
+    name |> String.split_on_char ' '
+    |> List.filter (fun word -> word <> "")
+    |> List.filter_map (fun word ->
+           if String.length word = 0 then None
+           else Some (String.sub word 0 1 |> String.uppercase_ascii))
+    |> String.concat ""
+  in
+  let initials = if initials = "" then "?" else initials in
+  "<svg version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\" class=\"avatar\" aria-hidden=\"true\"><rect width=\"100%\" height=\"100%\" rx=\"50\" fill=\"#3B4B59\"/><text x=\"50%\" y=\"50%\" fill=\"#FFFFFF\" text-anchor=\"middle\" dy=\"0.35em\" font-family=\"sans-serif\" font-size=\"230\" font-weight=\"800\">"
+  ^ html_escape initials ^ "</text></svg>"
+
+let safe_storage_key key =
+  String.length key >= 4
+  && String.for_all
+       (function
+         | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '-' | '_' -> true
+         | _ -> false)
+       key
+
+let read_avatar_file key =
+  if not (safe_storage_key key) then None
+  else
+    let root =
+      Sys.getenv_opt "CAMPFIRE_STORAGE_PATH"
+      |> Option.value ~default:"/rails/storage"
+    in
+    let path =
+      Filename.concat root
+        (Filename.concat "files"
+           (Filename.concat (String.sub key 0 2)
+              (Filename.concat (String.sub key 2 2) key)))
+    in
+    try
+      let channel = open_in_bin path in
+      Fun.protect
+        ~finally:(fun () -> close_in_noerr channel)
+        (fun () -> Some (really_input_string channel (in_channel_length channel)))
+    with _ -> None
+
+let show_avatar database secret path =
+  match avatar_token_of_path path with
+  | None -> response `Not_found "Not found"
+  | Some token ->
+      (match
+         Option.bind (Rails_crypto.percent_decode token)
+           (Rails_crypto.verify_user_avatar_id ~secret)
+       with
+      | None -> response `Not_found "Not found"
+      | Some user_id ->
+          (match Database.find_avatar_user database user_id with
+          | None -> response `Not_found "Not found"
+          | Some user ->
+              let headers content_type =
+                Cohttp.Header.init_with "content-type" content_type
+                |> fun headers ->
+                Cohttp.Header.add headers "cache-control"
+                  "public, max-age=1800, stale-while-revalidate=604800"
+              in
+              (match Database.find_avatar_blob database user_id with
+              | Some blob
+                when String.starts_with ~prefix:"image/" blob.Database.content_type ->
+                  (match read_avatar_file blob.Database.key with
+                  | Some image ->
+                      response ~headers:(headers blob.Database.content_type) `OK image
+                  | None -> response `Not_found "Not found")
+              | _ ->
+                  response ~headers:(headers "image/svg+xml; charset=utf-8") `OK
+                    (avatar_svg user.Database.name))))
 
 let profile_page database secret headers ?(error = "") () =
   match current_identity database secret headers with
@@ -1348,6 +1485,10 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
   | `GET, "/up" ->
       response `OK
         "<!doctype html><html><body style=\"background-color: green\">OK</body></html>"
+  | `GET, "/assets/campfire.css" ->
+      response ~headers:(Cohttp.Header.init_with "content-type" "text/css; charset=utf-8")
+        `OK
+        ":root{color-scheme:light dark}body{margin:0;font-family:system-ui,sans-serif}.sidebar__container{display:flex;flex-direction:column;gap:.75rem}.room,.direct{display:flex;align-items:center;padding:.5rem;text-decoration:none}.unread{font-weight:700}"
   | `GET, join_path when join_code_of_path join_path <> None ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
@@ -1377,6 +1518,14 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       | Some secret ->
           let query = query_parameters request |> fun params -> form_value params "q" in
           search_index database secret headers query)
+  | `GET, "/users/me/sidebar" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret -> sidebar_page database secret headers)
+  | `GET, avatar_path when avatar_token_of_path avatar_path <> None ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret -> show_avatar database secret avatar_path)
   | `GET, "/users/me/profile" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"

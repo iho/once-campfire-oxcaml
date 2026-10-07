@@ -82,13 +82,15 @@ let () =
       exec setup_db
         "CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,type TEXT NOT NULL,creator_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
-        "CREATE TABLE memberships(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,involvement TEXT DEFAULT 'mentions',connections INTEGER NOT NULL DEFAULT 0,UNIQUE(room_id,user_id))";
+        "CREATE TABLE memberships(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,involvement TEXT DEFAULT 'mentions',connections INTEGER NOT NULL DEFAULT 0,unread_at TEXT,UNIQUE(room_id,user_id))";
       exec setup_db
         "CREATE TABLE messages(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,creator_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
         "CREATE TABLE action_text_rich_texts(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,body TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(record_type,record_id,name))";
       exec setup_db
         "CREATE TABLE boosts(id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL,booster_id INTEGER NOT NULL,content TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE active_storage_blobs(id INTEGER PRIMARY KEY,key TEXT NOT NULL,content_type TEXT)";
       exec setup_db
         "CREATE TABLE active_storage_attachments(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,blob_id INTEGER NOT NULL)";
       exec setup_db "CREATE VIRTUAL TABLE message_search_index USING fts5(body)";
@@ -103,6 +105,13 @@ let () =
           ~timestamp:"2026-10-07 12:00:00.000"
         |> Option.get
       in
+      exec setup_db
+        "INSERT INTO active_storage_blobs(id,key,content_type) VALUES(77,'abcdefgxyz','image/png')";
+      exec setup_db
+        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('User',%d,'avatar',77)" user_id);
+      check "avatar lookup resolves the original Rails blob key and MIME type"
+        (Some { Database.key = "abcdefgxyz"; content_type = "image/png" })
+        (Database.find_avatar_blob (Some setup_db) user_id);
       exec setup_db
         "INSERT INTO users(id,name,email_address,password_digest,bio,role,status,created_at,updated_at) VALUES(99,'Inactive','duplicate@example.com',NULL,NULL,0,1,'2026-10-07','2026-10-07')";
       check "profile reads Rails profile fields" (Some ("Ada Lovelace", "ada@example.com", ""))
@@ -166,6 +175,23 @@ let () =
       check "first-run membership defaults to mentions" (Some "mentions")
         (Database.membership_involvement (Some setup_db) ~room_id:1
            ~user_id);
+      check "sidebar returns visible shared rooms" [ ("All Talk", false) ]
+        (Database.sidebar_rooms (Some setup_db) user_id
+        |> List.map (fun (entry : Database.sidebar_room) ->
+               (entry.Database.room.Database.name, entry.Database.unread)));
+      exec setup_db
+        "UPDATE memberships SET unread_at='2026-10-07 12:00:20' WHERE room_id=1";
+      check "sidebar exposes Rails unread state" [ ("All Talk", true) ]
+        (Database.sidebar_rooms (Some setup_db) user_id
+        |> List.map (fun (entry : Database.sidebar_room) ->
+               (entry.Database.room.Database.name, entry.Database.unread)));
+      check "sidebar excludes hidden memberships" true
+        (Database.update_membership_involvement (Some setup_db) ~room_id:1
+           ~user_id ~involvement:"invisible" ~timestamp:"2026-10-07 12:00:25.000"
+        && Database.sidebar_rooms (Some setup_db) user_id = []);
+      ignore
+        (Database.update_membership_involvement (Some setup_db) ~room_id:1
+           ~user_id ~involvement:"mentions" ~timestamp:"2026-10-07 12:00:26.000");
       check "membership notification preference can be updated" true
         (Database.update_membership_involvement (Some setup_db) ~room_id:1
            ~user_id ~involvement:"everything" ~timestamp:"2026-10-07 12:00:30.000");
