@@ -296,4 +296,59 @@ let () =
       check "repeat first-run leaves existing users unchanged" 3
         (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
              ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      let join_code =
+        Database.with_statement setup_db "SELECT join_code FROM accounts" (fun statement ->
+            ignore (Sqlite3.step statement);
+            Sqlite3.column_text statement 0)
+      in
+      check "invitation code matches this account" true
+        (Database.valid_join_code (Some setup_db) join_code);
+      check "invalid invitation code is rejected" false
+        (Database.valid_join_code (Some setup_db) "not-the-join-code");
+      let joined_user_id =
+        Database.create_join_user (Some setup_db) ~join_code ~name:"Lin"
+          ~email_address:"lin@example.com"
+          ~password_digest:(Bcrypt.hash "join password")
+          ~timestamp:"2026-10-07 12:30:00.000"
+        |> Option.get
+      in
+      check "joined user has member role" 0
+        (Database.with_statement setup_db "SELECT role FROM users WHERE id=?"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 joined_user_id);
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      check "joined user receives every existing open room only"
+        [ "All Talk"; "Planning" ]
+        (Database.with_statement setup_db
+           "SELECT r.name FROM rooms r JOIN memberships m ON m.room_id=r.id WHERE m.user_id=? ORDER BY r.id"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 joined_user_id);
+             let rec collect names =
+               match Sqlite3.step statement with
+               | Sqlite3.Rc.ROW -> collect (Sqlite3.column_text statement 0 :: names)
+               | Sqlite3.Rc.DONE -> List.rev names
+               | error -> failwith (Sqlite3.Rc.to_string error)
+             in
+             collect []));
+      (try
+         ignore
+           (Database.create_join_user (Some setup_db) ~join_code
+              ~name:"Duplicate" ~email_address:"grace@example.com"
+              ~password_digest:(Bcrypt.hash "another password")
+              ~timestamp:"2026-10-07 12:31:00.000");
+         failwith "duplicate join email unexpectedly succeeded"
+       with Database.Duplicate_email -> ());
+      (try
+         ignore
+           (Database.create_join_user (Some setup_db) ~join_code:"wrong"
+              ~name:"Wrong invite" ~email_address:"wrong@example.com"
+              ~password_digest:(Bcrypt.hash "join password")
+              ~timestamp:"2026-10-07 12:32:00.000");
+         failwith "invalid join code unexpectedly succeeded"
+       with Database.Invalid_join_code -> ());
+      check "failed invitations leave no extra user" 4
+        (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
+             ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0)))

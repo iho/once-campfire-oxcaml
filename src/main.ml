@@ -162,6 +162,24 @@ let first_run_form ?(name = "") ?(email = "") ?(error = "") csrf =
   ^ html_escape email
   ^ "\"></label><label>Password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" maxlength=\"72\" required></label><button type=\"submit\">Save</button></form></main></body></html>"
 
+let join_form ?(name = "") ?(email = "") ?(error = "") code csrf =
+  let error_html =
+    if error = "" then ""
+    else "<p role=\"alert\">" ^ html_escape error ^ "</p>"
+  in
+  "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ html_escape csrf
+  ^ "\"><title>Join Campfire</title></head><body><main><h1>Join Campfire</h1>"
+  ^ error_html
+  ^ "<form action=\"/join/" ^ html_escape code
+  ^ "\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+  ^ html_escape csrf
+  ^ "\"><label>Name<input name=\"user[name]\" autocomplete=\"name\" required value=\""
+  ^ html_escape name
+  ^ "\"></label><label>Email address<input type=\"email\" name=\"user[email_address]\" autocomplete=\"username\" required value=\""
+  ^ html_escape email
+  ^ "\"></label><label>Password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" maxlength=\"72\" required></label><button type=\"submit\">Join</button></form></main></body></html>"
+
 let namespaced_form_value form namespace key =
   let prefix = namespace ^ "[" in
   form
@@ -287,6 +305,11 @@ let room_at_message path =
           Option.map (fun message_id -> (room_id, message_id))
             (int_of_string_opt
                (String.sub message_id 1 (String.length message_id - 1))))
+  | _ -> None
+
+let join_code_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "join"; code ] when code <> "" -> Some code
   | _ -> None
 
 let message_room_id_of_path path =
@@ -511,6 +534,76 @@ let create_first_run database remote_ip secret headers body =
           (first_run_form ~name ~email
              ~error:"Campfire could not be set up with those details."
              session.Session.csrf_form_token)
+
+let create_join_user_request database remote_ip secret headers path body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"POST" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | Some _ -> redirect "/"
+    | None ->
+        (match join_code_of_path path with
+        | None -> response `Not_found "Not found"
+        | Some code when not (Database.valid_join_code database code) ->
+            response `Not_found "Not found"
+        | Some code ->
+            let name = namespaced_form_value form "user" "name" |> trim in
+            let email = namespaced_form_value form "user" "email_address" |> trim in
+            let password = namespaced_form_value form "user" "password" in
+            if name = "" || email = "" || password = ""
+               || String.length password > 72
+            then
+              html_with_session ~headers:html_headers ~secret session
+                `Unprocessable_entity
+                (join_form ~name ~email
+                   ~error:"Please enter a name, email address, and password no longer than 72 bytes."
+                   code session.Session.csrf_form_token)
+            else
+              try
+                let password_digest = Bcrypt.hash password in
+                let timestamp = timestamp_now () in
+                match
+                  Database.create_join_user database ~join_code:code ~name
+                    ~email_address:email ~password_digest ~timestamp
+                with
+                | None ->
+                    response `Service_unavailable
+                      "Campfire database is unavailable"
+                | Some user_id ->
+                    let token =
+                      Rails_crypto.random_bytes 18
+                      |> Rails_crypto.base64url_encode
+                    in
+                    Database.create_session database ~user_id ~token
+                      ~user_agent:(header headers "user-agent")
+                      ~ip_address:remote_ip ~timestamp;
+                    let response_headers =
+                      Cohttp.Header.init_with "location" "/"
+                      |> fun headers -> attach_session_cookie headers ~secret session
+                      |> fun headers -> start_session_cookie headers ~secret token
+                    in
+                    response ~headers:response_headers `Found ""
+              with
+              | Database.Invalid_join_code -> response `Not_found "Not found"
+              | Database.Duplicate_email ->
+                  redirect
+                    ("/session/new?email_address=" ^ encode_query email)
+              | _ ->
+                  html_with_session ~headers:html_headers ~secret session
+                    `Unprocessable_entity
+                    (join_form ~name ~email
+                       ~error:"Campfire could not create your account."
+                       code session.Session.csrf_form_token))
 
 let submit_message database secret headers room_id body =
   let session = load_session secret headers in
@@ -777,6 +870,20 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
   | `GET, "/up" ->
       response `OK
         "<!doctype html><html><body style=\"background-color: green\">OK</body></html>"
+  | `GET, join_path when join_code_of_path join_path <> None ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (match current_identity database secret headers with
+          | Some _ -> redirect "/"
+          | None ->
+              let code = Option.get (join_code_of_path join_path) in
+              if not (Database.valid_join_code database code) then
+                response `Not_found "Not found"
+              else
+                let session = load_session secret headers in
+                html_with_session ~secret session `OK
+                  (join_form code session.Session.csrf_form_token)))
   | `GET, "/first_run" ->
       if Database.account_exists database then redirect "/"
       else
@@ -849,6 +956,17 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
           | Request_body_too_large ->
               response `Request_entity_too_large "Request body too large"
           | _ -> response `Bad_request "Invalid setup request"))
+  | `POST, join_path when join_code_of_path join_path <> None ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try
+             create_join_user_request database remote_ip secret headers join_path
+               (request_body body)
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid invitation request"))
   | (`GET, "/") | (`GET, "/session/new") ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
@@ -875,7 +993,10 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
                     "/session/new")
           else if Database.user_exists database then
             html_with_session ~secret session `OK
-              (login_form session.Session.csrf_form_token)
+              (login_form
+                 ~email:(query_parameters request
+                         |> fun params -> form_value params "email_address")
+                 session.Session.csrf_form_token)
           else
             redirect
               ~headers:(attach_session_cookie (Cohttp.Header.init ()) ~secret session)

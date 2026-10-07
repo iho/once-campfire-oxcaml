@@ -14,6 +14,8 @@ type message = { id : int; creator_name : string; body_html : string; created_at
 type search_result = { message : message; room_id : int; room_name : string }
 
 exception Message_not_found
+exception Invalid_join_code
+exception Duplicate_email
 
 let path storage_root =
   Filename.concat (Filename.concat storage_root "db") "production.sqlite3"
@@ -133,6 +135,90 @@ let create_first_run database ~name ~email_address ~password_digest ~timestamp =
       with error ->
         (try run "ROLLBACK" with _ -> ());
         raise error)
+
+let create_join_user database ~join_code ~name ~email_address ~password_digest
+    ~timestamp =
+  Option.bind database (fun db ->
+      let run sql =
+        match Sqlite3.exec db sql with
+        | Sqlite3.Rc.OK -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "join transaction failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      run "BEGIN IMMEDIATE";
+      try
+        let current_join_code =
+          with_statement db "SELECT join_code FROM accounts ORDER BY id LIMIT 1"
+            (fun statement ->
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Sqlite3.column_text statement 0
+              | Sqlite3.Rc.DONE -> ""
+              | error ->
+                  failwith
+                    (Printf.sprintf "join-code lookup failed (%s): %s"
+                       (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)))
+        in
+        if join_code = "" || current_join_code <> join_code then
+          raise Invalid_join_code;
+        with_statement db
+          "INSERT INTO users(name,email_address,password_digest,role,status,created_at,updated_at) VALUES(?,?,?,0,0,?,?)"
+          (fun statement ->
+            List.iteri
+              (fun index value ->
+                check_rc db "bind joined user"
+                  (Sqlite3.bind_text statement (index + 1) value))
+              [ name; email_address; password_digest; timestamp; timestamp ];
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | Sqlite3.Rc.CONSTRAINT -> raise Duplicate_email
+            | error ->
+                failwith
+                  (Printf.sprintf "joined user insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        let user_id =
+          with_statement db "SELECT last_insert_rowid()" (fun statement ->
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0
+              | _ -> failwith "joined user insert returned no row")
+        in
+        with_statement db
+          "INSERT INTO memberships(room_id,user_id,created_at,updated_at) SELECT id,?,?,? FROM rooms WHERE type='Rooms::Open'"
+          (fun statement ->
+            check_rc db "bind joined-user membership id"
+              (Sqlite3.bind_int statement 1 user_id);
+            check_rc db "bind joined-user membership created time"
+              (Sqlite3.bind_text statement 2 timestamp);
+            check_rc db "bind joined-user membership updated time"
+              (Sqlite3.bind_text statement 3 timestamp);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "joined-user memberships insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        run "COMMIT";
+        Some user_id
+      with error ->
+        (try run "ROLLBACK" with _ -> ());
+        raise error)
+
+let valid_join_code database join_code =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      with_statement db "SELECT 1 FROM accounts WHERE join_code=? LIMIT 1"
+        (fun statement ->
+          check_rc db "bind invitation join code"
+            (Sqlite3.bind_text statement 1 join_code);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW -> true
+          | Sqlite3.Rc.DONE -> false
+          | error ->
+              failwith
+                (Printf.sprintf "invitation lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+    database
 
 let find_active_user database email_address =
   Option.bind database (fun db ->
