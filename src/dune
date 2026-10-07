@@ -9,13 +9,26 @@
 (library
  (name campfire_oxcaml_core)
  (wrapped false)
- (modules bcrypt database)
+ (modules bcrypt database rails_crypto session)
  (foreign_stubs
   (language c)
-  (names bcrypt_stubs bcrypt blf))
- (libraries sqlite3))
+  (flags
+   (:standard
+    -I/opt/homebrew/opt/openssl@3/include
+    -I/usr/local/opt/openssl@3/include))
+  (names bcrypt_stubs rails_crypto_stubs bcrypt blf))
+ (c_library_flags
+  -L/opt/homebrew/opt/openssl@3/lib
+  -L/usr/local/opt/openssl@3/lib
+  -lcrypto)
+ (libraries sqlite3 yojson unix))
 
 (test
  (name database_test)
  (modules database_test)
  (libraries campfire_oxcaml_core sqlite3))
+
+(test
+ (name rails_crypto_test)
+ (modules rails_crypto_test)
+ (libraries campfire_oxcaml_core))

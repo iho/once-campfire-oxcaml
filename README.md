@@ -13,7 +13,8 @@ version.
 
 ## Development
 
-Install [OxCaml](https://oxcaml.org/get-oxcaml/) and Dune, then run:
+Install [OxCaml](https://oxcaml.org/get-oxcaml/), Dune, and OpenSSL 3 development
+headers (`brew install openssl@3` on macOS), then run:
 
 ```sh
 opam switch create 5.2.0+ox \
@@ -25,16 +26,22 @@ opam exec --switch=5.2.0+ox -- dune build --profile=release
 opam exec --switch=5.2.0+ox -- dune exec campfire-oxcaml
 ```
 
-The server binds `0.0.0.0:3000`; `HTTP_PORT` selects another port. `/up` is a basic process
-health check. `GET /` follows the initial Rails setup/sign-in redirects, and the server
-opens an existing `CAMPFIRE_STORAGE_PATH/db/production.sqlite3` without creating or migrating
-it. First-run account creation and sign-in are not implemented; sign-in currently returns
-501. A native bcrypt verifier for existing `$2a$`, `$2b$` and `$2y$` digests is covered by
-independently generated bcryptjs 3.0.3 vectors, but no authenticated Campfire routes are
-implemented yet. The app uses Cohttp's Eio HTTP/1
-server; direct TLS, HTTP/2 and Action Cable remain future work.
+The server binds `0.0.0.0:3000`; `HTTP_PORT` selects another port. Set `SECRET_KEY_BASE`
+to the same Rails secret used by the reference installation. `/up` is a basic process health
+check. `GET /` follows the initial Rails setup/sign-in redirects, and the server opens an
+existing `CAMPFIRE_STORAGE_PATH/db/production.sqlite3` without creating or migrating it.
+Existing `$2a$`, `$2b$` and `$2y$` bcrypt digests can be verified; `GET /session/new` issues a
+Rails-compatible encrypted session cookie and CSRF form token, and `POST /session` verifies
+credentials, persists a Rails-schema session row, and returns a signed `session_token` cookie.
+The first-run account setup, authenticated Campfire screens, and forwarded-HTTPS cookie
+handling are not implemented yet. Logout deletes the session row and clears the signed
+cookie. Login attempts are limited to 10 per IP in three
+minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),
+leaving the Rails database schema untouched. The app uses Cohttp's Eio HTTP/1 server; direct
+TLS, HTTP/2 and Action Cable remain future work.
 
-Run the native SQLite checks with `opam exec --switch=5.2.0+ox -- dune runtest --profile=release`.
+Run the native SQLite, bcrypt and Rails cookie/CSRF checks with
+`opam exec --switch=5.2.0+ox -- dune runtest --profile=release`.
 
 ## Compatibility status
 
