@@ -349,8 +349,12 @@ let render_message_item ~secret ?(room_name = "") ?(boosts = [])
   ^ (boosts |> List.map (render_boost ~secret) |> String.concat "")
   ^ "</div></div></article></div>"
 
-let render_live_message ~secret database ~room_name user room_id csrf
+let render_live_message ~secret ~room_name ~boosts ~attachments user room_id csrf
     (message : Database.message) =
+  render_message_item ~secret ~room_name ~boosts ~attachments user room_id csrf
+    message
+
+let live_message_details database (message : Database.message) =
   let boosts =
     Database.boosts_for_messages database [ message ]
     |> List.assoc_opt message.Database.id |> Option.value ~default:[]
@@ -359,8 +363,7 @@ let render_live_message ~secret database ~room_name user room_id csrf
     Database.attachments_for_messages database [ message ]
     |> List.assoc_opt message.Database.id |> Option.to_list
   in
-  render_message_item ~secret ~room_name ~boosts ~attachments user room_id csrf
-    message
+  (boosts, attachments)
 
 let room_page ~secret (user : Database.user) (rooms : Database.room list)
     (current : Database.room) csrf (messages : Database.message list)
@@ -884,23 +887,27 @@ let submit_message message_bus database secret headers room_id body =
                   ~client_message_id
                   ~timestamp:(timestamp_now ()) with
                 | Some message_id ->
+                    let message = Database.find_message database room_id message_id in
+                    let boosts, attachments =
+                      Option.fold ~none:([], [])
+                        ~some:(live_message_details database) message
+                    in
                     Option.iter
-                      (Cable_bus.publish message_bus ~room_id)
-                      (Database.find_message database room_id message_id);
+                      (Cable_bus.publish message_bus ~room_id
+                         ~room_name:room.Database.name ~boosts ~attachments)
+                      message;
                     Database.room_member_ids database room_id
                     |> List.iter (fun user_id ->
                            Cable_bus.publish_unread message_bus ~user_id ~room_id);
                     if accepts_turbo_stream then
-                      let message =
-                        Database.find_message database room_id message_id
-                        |> Option.get
-                      in
+                      let message = Option.get message in
                       let html =
                         "<turbo-stream action=\"append\" target=\"room_"
                         ^ string_of_int room_id ^ "_messages\"><template>"
-                        ^ render_live_message ~secret database
-                            ~room_name:room.Database.name identity.Database.user
-                            room_id session.Session.csrf_form_token message
+                        ^ render_live_message ~secret
+                            ~room_name:room.Database.name ~boosts ~attachments
+                            identity.Database.user room_id
+                            session.Session.csrf_form_token message
                         ^ "</template></turbo-stream>"
                       in
                       let headers =
@@ -967,8 +974,20 @@ let mutate_message_request message_bus database secret headers room_id message_i
                    ~user_id:identity.Database.user.id
                    ~role:identity.Database.user.role ~body:content
                    ~timestamp:(timestamp_now ());
-                 Option.iter (Cable_bus.publish_replace message_bus ~room_id)
-                   (Database.find_message database room_id message_id);
+                 let message = Database.find_message database room_id message_id in
+                 let boosts, attachments =
+                   Option.fold ~none:([], [])
+                     ~some:(live_message_details database) message
+                 in
+                 let room_name =
+                   Database.find_room_for_user database identity.Database.user.id room_id
+                   |> Option.map (fun (room : Database.room) -> room.Database.name)
+                   |> Option.value ~default:""
+                 in
+                 Option.iter
+                   (Cable_bus.publish_replace message_bus ~room_id ~room_name
+                      ~boosts ~attachments)
+                   message;
                  redirect path)
            | "DELETE" ->
                let message_dom_id =
@@ -2472,12 +2491,6 @@ let cable_websocket env database message_bus database_lock identity secret csrf 
       (`Assoc
         [ ("identifier", `String identifier); ("message", `String html) ])
   in
-  let room_name room_id =
-    database_read (fun () ->
-      Database.find_room_for_user database identity.Database.user.Database.id room_id)
-    |> Option.map (fun (room : Database.room) -> room.Database.name)
-    |> Option.value ~default:""
-  in
   let subscribe identifier (channel, signed_name) =
     match database_read (fun () ->
       authorize_cable_subscription database identity secret (channel, signed_name)) with
@@ -2518,25 +2531,25 @@ let cable_websocket env database message_bus database_lock identity secret csrf 
   let notify () =
     while true do
       match Eio.Stream.take events with
-      | Cable_bus.Message (identifier, room_id, (message : Database.message))
+      | Cable_bus.Message
+          (identifier, room_id, room_name, (message : Database.message), boosts, attachments)
         when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
           let html =
             "<turbo-stream action=\"append\" target=\"room_"
             ^ string_of_int room_id ^ "_messages\"><template>"
-            ^ render_live_message ~secret database
-                ~room_name:(room_name room_id) identity.Database.user room_id csrf
-                message
+            ^ render_live_message ~secret ~room_name ~boosts ~attachments
+                identity.Database.user room_id csrf message
             ^ "</template></turbo-stream>"
           in
           send_stream identifier html
-      | Cable_bus.Replace (identifier, room_id, (message : Database.message))
+      | Cable_bus.Replace
+          (identifier, room_id, room_name, (message : Database.message), boosts, attachments)
         when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
       let html =
             "<turbo-stream action=\"replace\" target=\"message_"
             ^ html_escape message.Database.client_message_id ^ "\"><template>"
-            ^ render_live_message ~secret database
-                ~room_name:(room_name room_id) identity.Database.user room_id csrf
-                message
+            ^ render_live_message ~secret ~room_name ~boosts ~attachments
+                identity.Database.user room_id csrf message
             ^ "</template></turbo-stream>"
           in
           send_stream identifier html
@@ -2751,7 +2764,7 @@ let () =
   in
   let domains =
     match Sys.getenv_opt "WEB_WORKERS" with
-    | None -> 4
+    | None -> 1
     | Some value -> (try max 1 (min 64 (int_of_string value)) with Failure _ -> 4)
   in
   let storage_root =

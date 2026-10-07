@@ -1,6 +1,8 @@
 type event =
-  | Message of string * int * Database.message
-  | Replace of string * int * Database.message
+  | Message of string * int * string * Database.message * Database.boost list
+      * Database.message_attachment list
+  | Replace of string * int * string * Database.message * Database.boost list
+      * Database.message_attachment list
   | Remove of string * string
   | Unread of string * int
   | Read of string * int
@@ -44,22 +46,22 @@ let unsubscribe subscription =
         List.filter (fun (subscriber : subscriber) -> subscriber.id <> subscription.id)
           bus.subscribers)
 
-let publish bus ~room_id message =
+let publish bus ~room_id ~room_name ~boosts ~attachments message =
   Eio.Mutex.use_rw ~protect:true bus.lock (fun () ->
       List.iter
         (fun subscriber ->
           if subscriber.topic = Room room_id then
             Eio.Stream.add subscriber.queue
-              (Message (subscriber.identifier, room_id, message)))
+              (Message (subscriber.identifier, room_id, room_name, message, boosts, attachments)))
         bus.subscribers)
 
-let publish_replace bus ~room_id message =
+let publish_replace bus ~room_id ~room_name ~boosts ~attachments message =
   Eio.Mutex.use_rw ~protect:true bus.lock (fun () ->
       List.iter
         (fun subscriber ->
           if subscriber.topic = Room room_id then
             Eio.Stream.add subscriber.queue
-              (Replace (subscriber.identifier, room_id, message)))
+              (Replace (subscriber.identifier, room_id, room_name, message, boosts, attachments)))
         bus.subscribers)
 
 let publish_remove bus ~room_id ~message_dom_id =

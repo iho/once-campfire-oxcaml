@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build --chown=campfire:campfire /src/_build/default/src/main.exe /usr/local/bin/campfire
 COPY --from=build --chown=campfire:campfire /src/assets /rails/assets
-ENV HTTP_PORT=80 CAMPFIRE_STORAGE_PATH=/rails/storage
+ENV HTTP_PORT=80 CAMPFIRE_STORAGE_PATH=/rails/storage WEB_WORKERS=1
 USER campfire
 WORKDIR /rails
 EXPOSE 80
