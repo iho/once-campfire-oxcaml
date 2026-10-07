@@ -36,7 +36,8 @@ credentials, persists a Rails-schema session row, and returns a signed `session_
 First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
 room, and membership atomically, then starts a session. Authenticated users can navigate
 membership-scoped room pages and post plain-text messages stored in Rails Action Text and FTS
-tables. Search queries use the existing FTS index and retain the user's ten most recent
+tables, and create public rooms that grant access to all active users. Room creation honors
+the account's administrator-only setting. Search queries use the existing FTS index and retain the user's ten most recent
 searches. Message history supports 40-message older/newer cursors and room permalinks centered
 on a message. Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout
@@ -51,8 +52,8 @@ Run the native SQLite, bcrypt and Rails cookie/CSRF checks with
 ## Compatibility status
 
 No Rails compatibility or production-readiness claim is made yet. This is an early port:
-account/session authentication is partial, and the authenticated room/message feature set
-remains to be implemented against the pinned Rails reference and real SQLite fixtures. See
+account/session authentication and the authenticated room/message feature set are partial,
+and production-database verification remains incomplete. See
 [verification status](plans/contracts.md).
 
 ## License

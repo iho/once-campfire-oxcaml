@@ -229,6 +229,80 @@ let find_room_for_user database user_id room_id =
   rooms_for_user database user_id
   |> List.find_opt (fun (room : room) -> room.id = room_id)
 
+let room_creation_restricted database =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      with_statement db "SELECT settings FROM accounts ORDER BY id LIMIT 1" (fun statement ->
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW ->
+              (match Sqlite3.column statement 0 with
+              | Sqlite3.Data.NULL -> false
+              | Sqlite3.Data.TEXT settings ->
+                  (try
+                     settings |> Yojson.Safe.from_string
+                     |> Yojson.Safe.Util.member "restrict_room_creation_to_administrators"
+                     |> Yojson.Safe.Util.to_bool
+                   with _ -> false)
+              | _ -> false)
+          | Sqlite3.Rc.DONE -> false
+          | error ->
+              failwith
+                (Printf.sprintf "account settings lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+    database
+
+let create_open_room database ~name ~creator_id ~timestamp =
+  Option.bind database (fun db ->
+      let run sql =
+        match Sqlite3.exec db sql with
+        | Sqlite3.Rc.OK -> ()
+        | error ->
+            failwith
+              (Printf.sprintf "room transaction failed (%s): %s"
+                 (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+      in
+      run "BEGIN IMMEDIATE";
+      try
+        if not (exists db
+          (Printf.sprintf "SELECT 1 FROM users WHERE id=%d AND status=0 LIMIT 1" creator_id))
+        then failwith "active room creator required";
+        with_statement db
+          "INSERT INTO rooms(name,type,creator_id,created_at,updated_at) VALUES(?, 'Rooms::Open', ?, ?, ?)"
+          (fun statement ->
+            check_rc db "bind room name" (Sqlite3.bind_text statement 1 name);
+            check_rc db "bind room creator" (Sqlite3.bind_int statement 2 creator_id);
+            check_rc db "bind room creation time" (Sqlite3.bind_text statement 3 timestamp);
+            check_rc db "bind room update time" (Sqlite3.bind_text statement 4 timestamp);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        let room_id =
+          with_statement db "SELECT last_insert_rowid()" (fun statement ->
+              match Sqlite3.step statement with
+              | Sqlite3.Rc.ROW -> Sqlite3.column_int statement 0
+              | _ -> failwith "room insert returned no row")
+        in
+        with_statement db
+          "INSERT INTO memberships(room_id,user_id,created_at,updated_at) SELECT ?,id,?,? FROM users WHERE status=0"
+          (fun statement ->
+            check_rc db "bind new-room membership room" (Sqlite3.bind_int statement 1 room_id);
+            check_rc db "bind new-room membership created time" (Sqlite3.bind_text statement 2 timestamp);
+            check_rc db "bind new-room membership updated time" (Sqlite3.bind_text statement 3 timestamp);
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "room memberships insert failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        run "COMMIT";
+        Some room_id
+      with error ->
+        (try run "ROLLBACK" with _ -> ());
+        raise error)
+
 let messages_for_room ?before ?after ?around database room_id =
   Option.fold ~none:[]
     ~some:(fun db ->

@@ -76,7 +76,7 @@ let () =
     ~finally:(fun () -> ignore (Sqlite3.db_close setup_db))
     (fun () ->
       exec setup_db
-        "CREATE TABLE accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,join_code TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,singleton_guard INTEGER NOT NULL DEFAULT 0 UNIQUE)";
+        "CREATE TABLE accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,join_code TEXT NOT NULL,settings TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,singleton_guard INTEGER NOT NULL DEFAULT 0 UNIQUE)";
       exec setup_db
         "CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email_address TEXT UNIQUE,password_digest TEXT,role INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
@@ -175,6 +175,48 @@ let () =
         (Database.with_statement setup_db "SELECT count(*) FROM messages" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));
+      exec setup_db
+        "INSERT INTO users(id,name,email_address,role,status,created_at,updated_at) VALUES(2,'Grace','grace@example.com',0,0,'2026-10-07','2026-10-07'),(3,'Inactive','inactive@example.com',0,1,'2026-10-07','2026-10-07')";
+      check "room creation restriction defaults to false" false
+        (Database.room_creation_restricted (Some setup_db));
+      let open_room_id =
+        Database.create_open_room (Some setup_db) ~name:"Planning"
+          ~creator_id:user_id ~timestamp:"2026-10-07 12:03:00.000"
+        |> Option.get
+      in
+      check "new open room type and creator" "Rooms::Open:1"
+        (Database.with_statement setup_db
+           "SELECT type||':'||creator_id FROM rooms WHERE id=?"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 open_room_id);
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0));
+      check "open room grants memberships to all active users" [ 1; 2 ]
+        (Database.with_statement setup_db
+           "SELECT user_id FROM memberships WHERE room_id=? ORDER BY user_id"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 open_room_id);
+             let rec collect acc =
+               match Sqlite3.step statement with
+               | Sqlite3.Rc.ROW -> collect (Sqlite3.column_int statement 0 :: acc)
+               | Sqlite3.Rc.DONE -> List.rev acc
+               | error -> failwith (Sqlite3.Rc.to_string error)
+             in
+             collect []));
+      exec setup_db
+        "UPDATE accounts SET settings='{\"restrict_room_creation_to_administrators\":true}'";
+      check "account setting restricts room creation" true
+        (Database.room_creation_restricted (Some setup_db));
+      (try
+         ignore
+           (Database.create_open_room (Some setup_db) ~name:"Forbidden"
+              ~creator_id:(user_id + 2) ~timestamp:"2026-10-07 12:04:00.000");
+         failwith "inactive room creator unexpectedly succeeded"
+       with Failure message when message = "active room creator required" -> ());
+      check "failed open-room creation is rolled back" 2
+        (Database.with_statement setup_db "SELECT count(*) FROM rooms" (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
       for index = 2 to 42 do
         Database.create_message (Some setup_db) ~room_id:1 ~creator_id:user_id
           ~body:(Printf.sprintf "page message %02d" index)
@@ -222,7 +264,7 @@ let () =
               ~timestamp:"2026-10-07 12:01:00.000");
          failwith "second first-run setup unexpectedly succeeded"
        with Failure message when message = "Campfire has already been set up" -> ());
-      check "repeat first-run leaves one user" 1
+      check "repeat first-run leaves existing users unchanged" 3
         (Database.with_statement setup_db "SELECT count(*) FROM users" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0)))

@@ -236,7 +236,7 @@ let room_page (user : Database.user) (rooms : Database.room list)
   ^ " · Campfire</title><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
   ^ html_escape csrf
   ^ "\"></head><body><nav><a href=\"/\">Campfire</a> <a href=\"/searches\">Search</a><p>"
-  ^ html_escape user.Database.name ^ "</p><ul>" ^ links
+  ^ html_escape user.Database.name ^ "</p><a href=\"/rooms/opens/new\">New room</a><ul>" ^ links
   ^ "</ul></nav><main><h1>"
   ^ html_escape current.Database.name
   ^ "</h1><section aria-label=\"Messages\"><ol>"
@@ -557,6 +557,52 @@ let search_index database secret headers query =
         (search_page identity.Database.user session.Session.csrf_form_token query
            (Database.recent_searches database identity.Database.user.id) results)
 
+let room_creation_forbidden database (user : Database.user) =
+  Database.room_creation_restricted database && user.Database.role <> 1
+
+let new_open_room database secret headers =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity when room_creation_forbidden database identity.Database.user ->
+      response `Forbidden "Room creation is restricted to administrators"
+  | Some _ ->
+      let session = load_session secret headers in
+      html_with_session ~secret session `OK
+        ("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+        ^ html_escape session.Session.csrf_form_token
+        ^ "\"><title>New room · Campfire</title></head><body><main><a href=\"/\">Campfire</a><h1>New room</h1><form action=\"/rooms/opens\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+        ^ html_escape session.Session.csrf_form_token
+        ^ "\"><label>Room name<input name=\"room[name]\" required autofocus></label><button type=\"submit\">Create room</button></form></main></body></html>")
+
+let create_open_room_request database secret headers body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token =
+    match Cohttp.Header.get headers "x-csrf-token" with
+    | Some token -> token
+    | None -> form_value form "authenticity_token"
+  in
+  if not (valid_origin headers)
+     || not
+          (Session.valid_csrf ~path:"/rooms/opens" ~method_:"POST" session
+             authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity when room_creation_forbidden database identity.Database.user ->
+        response `Forbidden "Room creation is restricted to administrators"
+    | Some identity ->
+        let name = namespaced_form_value form "room" "name" in
+        (match
+           Database.create_open_room database ~name
+             ~creator_id:identity.Database.user.id ~timestamp:(timestamp_now ())
+         with
+        | Some room_id -> redirect ("/rooms/" ^ string_of_int room_id)
+        | None -> response `Unprocessable_entity "Room could not be saved")
+
 let record_search_request database secret headers body =
   let session = load_session secret headers in
   let form = parse_form body in
@@ -674,6 +720,19 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       | Some secret ->
           let query = query_parameters request |> fun params -> form_value params "q" in
           search_index database secret headers query)
+  | `GET, "/rooms/opens/new" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret -> new_open_room database secret headers)
+  | `POST, "/rooms/opens" ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          (try create_open_room_request database secret headers (request_body body)
+           with
+          | Request_body_too_large ->
+              response `Request_entity_too_large "Request body too large"
+          | _ -> response `Bad_request "Invalid room request"))
   | `POST, "/searches" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
