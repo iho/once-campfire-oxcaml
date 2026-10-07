@@ -35,9 +35,9 @@ Rails-compatible encrypted session cookie and CSRF form token, and `POST /sessio
 credentials, persists a Rails-schema session row, and returns a signed `session_token` cookie.
 First-run setup creates the Rails-shaped Campfire account, administrator, “All Talk” open
 room, and membership atomically, then starts a session. Authenticated users can navigate
-membership-scoped room pages and post plain-text messages stored in Rails Action Text and FTS
-tables, and create public rooms that grant access to all active users. Room creation honors
-the account's administrator-only setting. Search queries use the existing FTS index and retain the user's ten most recent
+membership-scoped room pages, create public rooms for all active users and private rooms
+for selected members, and post plain-text messages stored in Rails Action Text and FTS
+tables. Room creation honors the account's administrator-only setting. Search queries use the existing FTS index and retain the user's ten most recent
 searches. Message history supports 40-message older/newer cursors and room permalinks centered
 on a message. Avatar upload, rich formatting, attachments, real-time delivery, and forwarded-HTTPS
 cookie handling are not implemented yet. Logout

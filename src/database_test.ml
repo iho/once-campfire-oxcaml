@@ -177,6 +177,10 @@ let () =
              Sqlite3.column_int statement 0));
       exec setup_db
         "INSERT INTO users(id,name,email_address,role,status,created_at,updated_at) VALUES(2,'Grace','grace@example.com',0,0,'2026-10-07','2026-10-07'),(3,'Inactive','inactive@example.com',0,1,'2026-10-07','2026-10-07')";
+      check "active room-form users omit inactive accounts"
+        [ "Ada Lovelace"; "Grace" ]
+        (Database.active_users (Some setup_db)
+        |> List.map (fun (user : Database.user_option) -> user.Database.name));
       check "room creation restriction defaults to false" false
         (Database.room_creation_restricted (Some setup_db));
       let open_room_id =
@@ -203,6 +207,31 @@ let () =
                | error -> failwith (Sqlite3.Rc.to_string error)
              in
              collect []));
+      let closed_room_id =
+        Database.create_closed_room (Some setup_db) ~name:"Private planning"
+          ~creator_id:user_id ~member_ids:[ user_id + 1; user_id + 1; 999 ]
+          ~timestamp:"2026-10-07 12:03:30.000"
+        |> Option.get
+      in
+      check "new private room type" "Rooms::Closed"
+        (Database.with_statement setup_db
+           "SELECT type FROM rooms WHERE id=?"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 closed_room_id);
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0));
+      check "private room grants creator and selected users once" [ 1; 2 ]
+        (Database.with_statement setup_db
+           "SELECT user_id FROM memberships WHERE room_id=? ORDER BY user_id"
+           (fun statement ->
+             ignore (Sqlite3.bind_int statement 1 closed_room_id);
+             let rec collect acc =
+               match Sqlite3.step statement with
+               | Sqlite3.Rc.ROW -> collect (Sqlite3.column_int statement 0 :: acc)
+               | Sqlite3.Rc.DONE -> List.rev acc
+               | error -> failwith (Sqlite3.Rc.to_string error)
+             in
+             collect []));
       exec setup_db
         "UPDATE accounts SET settings='{\"restrict_room_creation_to_administrators\":true}'";
       check "account setting restricts room creation" true
@@ -213,7 +242,7 @@ let () =
               ~creator_id:(user_id + 2) ~timestamp:"2026-10-07 12:04:00.000");
          failwith "inactive room creator unexpectedly succeeded"
        with Failure message when message = "active room creator required" -> ());
-      check "failed open-room creation is rolled back" 2
+      check "failed open-room creation is rolled back" 3
         (Database.with_statement setup_db "SELECT count(*) FROM rooms" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_int statement 0));
