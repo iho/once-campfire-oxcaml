@@ -15,10 +15,10 @@ jobs:
     env:
       OPAMROOT: ${{ github.workspace }}/.opam-root
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         # The Rails reference submodule is not needed by the OxCaml build or tests.
       - name: Cache OxCaml toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .opam-root
           key: opam-${{ runner.os }}-debian-trixie-5.2.0+ox-${{ hashFiles('once_campfire_oxcaml.opam') }}-3416edee6b2416f5752ce101e3f7a1933e570a32

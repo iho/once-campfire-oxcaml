@@ -82,7 +82,7 @@ let () =
       exec setup_db
         "CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,type TEXT NOT NULL,creator_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
-        "CREATE TABLE memberships(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,involvement TEXT DEFAULT 'mentions',connections INTEGER NOT NULL DEFAULT 0,unread_at TEXT,UNIQUE(room_id,user_id))";
+        "CREATE TABLE memberships(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,involvement TEXT DEFAULT 'mentions',connections INTEGER NOT NULL DEFAULT 0,connected_at TEXT,unread_at TEXT,UNIQUE(room_id,user_id))";
       exec setup_db
         "CREATE TABLE messages(id INTEGER PRIMARY KEY,room_id INTEGER NOT NULL,creator_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
@@ -90,9 +90,9 @@ let () =
       exec setup_db
         "CREATE TABLE boosts(id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL,booster_id INTEGER NOT NULL,content TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
-        "CREATE TABLE active_storage_blobs(id INTEGER PRIMARY KEY,key TEXT NOT NULL,content_type TEXT)";
+        "CREATE TABLE active_storage_blobs(id INTEGER PRIMARY KEY,key TEXT NOT NULL,content_type TEXT,filename TEXT,byte_size INTEGER,metadata TEXT)";
       exec setup_db
-        "CREATE TABLE active_storage_attachments(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,blob_id INTEGER NOT NULL)";
+        "CREATE TABLE active_storage_attachments(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,blob_id INTEGER NOT NULL,created_at TEXT)";
       exec setup_db "CREATE VIRTUAL TABLE message_search_index USING fts5(body)";
       exec setup_db
         "CREATE TABLE searches(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,query TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
@@ -106,7 +106,9 @@ let () =
         |> Option.get
       in
       exec setup_db
-        "INSERT INTO active_storage_blobs(id,key,content_type) VALUES(77,'abcdefgxyz','image/png')";
+        "INSERT INTO active_storage_blobs(id,key,content_type,filename,byte_size) VALUES(77,'abcdefgxyz','image/png','image.png',3)";
+      exec setup_db
+        "INSERT INTO active_storage_blobs(id,key,content_type,filename,byte_size) VALUES(78,'ghijklmnop','text/plain','attached.txt',3)";
       exec setup_db
         (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('User',%d,'avatar',77)" user_id);
       check "avatar lookup resolves the original Rails blob key and MIME type"
@@ -204,11 +206,43 @@ let () =
         (Database.update_membership_involvement (Some setup_db) ~room_id:1
            ~user_id:(user_id + 1) ~involvement:"nothing"
            ~timestamp:"2026-10-07 12:00:32.000");
-      Database.create_message (Some setup_db) ~room_id:1 ~creator_id:user_id
-        ~body:"hello <script>&\nagain" ~client_message_id:"00000000-0000-4000-8000-000000000001"
-        ~timestamp:"2026-10-07 12:01:00.000";
+      check "message creation returns its persisted ID" (Some 1)
+        (Database.create_message_with_id (Some setup_db) ~room_id:1
+           ~creator_id:user_id ~body:"hello <script>&\nagain"
+           ~client_message_id:"00000000-0000-4000-8000-000000000001"
+           ~timestamp:"2026-10-07 12:01:00.000");
       check "message reads through Rails Action Text" 1
         (Database.messages_for_room (Some setup_db) 1 |> List.length);
+      exec setup_db
+        (Printf.sprintf
+           "INSERT INTO boosts(message_id,booster_id,content,created_at,updated_at) VALUES(1,%d,'👍','2026-10-07 12:02:00','2026-10-07 12:02:00')"
+           user_id);
+      check "message boosts retain Rails order and booster identity"
+        [ (1, [ { Database.id = 1; message_id = 1; booster_id = user_id;
+                  booster_name = "Ada Lovelace"; content = "👍";
+                  created_at = "2026-10-07 12:02:00" } ]) ]
+        (Database.boosts_for_messages (Some setup_db)
+           (Database.messages_for_room (Some setup_db) 1));
+      check "reachable message lookup requires membership" (Some 1)
+        (Database.room_id_for_message_user (Some setup_db) ~message_id:1
+           ~user_id);
+      check "unreachable message lookup rejects non-members" None
+        (Database.room_id_for_message_user (Some setup_db) ~message_id:1
+           ~user_id:(user_id + 1));
+      check "boost can be created with persisted identity" (Some 2)
+        (Database.create_boost (Some setup_db) ~message_id:1 ~booster_id:user_id
+           ~content:"🎉" ~timestamp:"2026-10-07 12:03:00.000");
+      check "boost deletion is restricted to its booster" false
+        (Database.delete_boost (Some setup_db) ~boost_id:2 ~message_id:1
+           ~booster_id:(user_id + 1));
+      check "booster can delete their own boost" true
+        (Database.delete_boost (Some setup_db) ~boost_id:2 ~message_id:1
+           ~booster_id:user_id);
+      check "live-message cursor begins after the selected ID" [ 1 ]
+        (Database.messages_after_id (Some setup_db) 1 0
+        |> List.map (fun (message : Database.message) -> message.Database.id));
+      check "live-message cursor excludes previously delivered messages" []
+        (Database.messages_after_id (Some setup_db) 1 1);
       check "message text is escaped in Rails Action Text storage"
         "<div>hello &lt;script&gt;&amp;</div><div>again</div>"
         (Database.messages_for_room (Some setup_db) 1
@@ -629,10 +663,12 @@ let () =
           ~creator_id:user_id ~member_ids:[] ~timestamp:"2026-10-07 12:43:00.000"
         |> Option.get
       in
-      Database.create_message (Some setup_db) ~room_id:attached_room_id
+      ignore
+        (Database.create_message_with_id ~attachment_blob_id:78 (Some setup_db)
+           ~room_id:attached_room_id
         ~creator_id:user_id ~body:"attached"
         ~client_message_id:"00000000-0000-4000-8000-000000000097"
-        ~timestamp:"2026-10-07 12:43:01.000";
+        ~timestamp:"2026-10-07 12:43:01.000");
       let attached_message_id =
         Database.with_statement setup_db
           "SELECT id FROM messages WHERE client_message_id='00000000-0000-4000-8000-000000000097'"
@@ -640,8 +676,17 @@ let () =
             ignore (Sqlite3.step statement);
             Sqlite3.column_int statement 0)
       in
-      exec setup_db
-        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('Message',%d,'attachment',1)" attached_message_id);
+      check "message attachment query returns Rails blob metadata"
+        [ (attached_message_id,
+           { Database.message_id = attached_message_id; blob_id = 78;
+             key = "ghijklmnop"; filename = "attached.txt";
+             content_type = "text/plain"; byte_size = 3 }) ]
+        (Database.attachments_for_messages (Some setup_db)
+           (Database.messages_for_room (Some setup_db) attached_room_id));
+      check "room members can fetch an attached message blob" true
+        (Database.authorized_stored_blob (Some setup_db) ~blob_id:78 ~user_id);
+      check "non-members cannot fetch an attached message blob" false
+        (Database.authorized_stored_blob (Some setup_db) ~blob_id:78 ~user_id:3);
       (try
          ignore
            (Database.delete_room (Some setup_db) ~room_id:attached_room_id
@@ -660,4 +705,79 @@ let () =
         (Database.delete_room (Some setup_db) ~room_id:direct_room_id
            ~user_id:(user_id + 1) ~role:0);
       check "direct conversation deletion removes all memberships" []
-        (Database.room_member_ids (Some setup_db) direct_room_id))
+        (Database.room_member_ids (Some setup_db) direct_room_id);
+      let member_timestamp = "2026-10-07 12:50:00.000" in
+      check "first presence requires membership" true
+        (Database.membership_present (Some setup_db) ~room_id:1 ~user_id:2
+           ~timestamp:member_timestamp);
+      check "second presence increments connection count" true
+        (Database.membership_present (Some setup_db) ~room_id:1 ~user_id:2
+           ~timestamp:"2026-10-07 12:50:01.000");
+      check "refresh preserves simultaneous connections" true
+        (Database.membership_refresh (Some setup_db) ~room_id:1 ~user_id:2
+           ~timestamp:"2026-10-07 12:50:02.000");
+      check "first disconnect preserves remaining connection" true
+        (Database.membership_absent (Some setup_db) ~room_id:1 ~user_id:2
+           ~timestamp:"2026-10-07 12:50:03.000");
+      check "presence count after one disconnect" 1
+        (Database.with_statement setup_db
+           "SELECT connections FROM memberships WHERE room_id=1 AND user_id=2"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      check "last disconnect clears connected timestamp" true
+        (Database.membership_absent (Some setup_db) ~room_id:1 ~user_id:2
+           ~timestamp:"2026-10-07 12:50:04.000");
+      check "last disconnect clears connection state" [ 0; 1 ]
+        (Database.with_statement setup_db
+           "SELECT connections,connected_at IS NULL FROM memberships WHERE room_id=1 AND user_id=2"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             [ Sqlite3.column_int statement 0; Sqlite3.column_int statement 1 ]));
+      check "message marks disconnected visible membership unread" true
+        (match
+           Database.create_message_with_id (Some setup_db) ~room_id:1
+             ~creator_id:user_id ~body:"unread after disconnect"
+             ~client_message_id:"00000000-0000-4000-8000-000000000099"
+             ~timestamp:"2026-10-07 12:51:00.000"
+         with Some _ -> true | None -> false);
+      check "unread timestamp matches received message" "2026-10-07 12:51:00.000"
+        (Database.with_statement setup_db
+           "SELECT unread_at FROM memberships WHERE room_id=1 AND user_id=2"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0));
+      check "connecting clears unread state" true
+        (Database.membership_present (Some setup_db) ~room_id:1 ~user_id:2
+           ~timestamp:"2026-10-07 12:51:01.000");
+      check "connecting clears unread timestamp" 1
+        (Database.with_statement setup_db
+           "SELECT unread_at IS NULL FROM memberships WHERE room_id=1 AND user_id=2"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_int statement 0));
+      let search_room_id =
+        Database.create_closed_room (Some setup_db) ~name:"Search ordering"
+          ~creator_id:user_id ~member_ids:[]
+          ~timestamp:"2026-10-07 12:52:00.000"
+        |> Option.get
+      in
+      let later_id =
+        Database.create_message_with_id (Some setup_db) ~room_id:search_room_id
+          ~creator_id:user_id ~body:"orderprobe later"
+          ~client_message_id:"00000000-0000-4000-8000-000000000101"
+          ~timestamp:"2026-10-07 12:53:00.000"
+        |> Option.get
+      in
+      let earlier_id =
+        Database.create_message_with_id (Some setup_db) ~room_id:search_room_id
+          ~creator_id:user_id ~body:"orderprobe earlier"
+          ~client_message_id:"00000000-0000-4000-8000-000000000102"
+          ~timestamp:"2026-10-07 12:52:30.000"
+        |> Option.get
+      in
+      check "search results follow Rails chronological order" [ earlier_id; later_id ]
+        (Database.search_messages (Some setup_db) user_id "\"orderprobe\""
+        |> List.map (fun (result : Database.search_result) ->
+               result.Database.message.Database.id))
+    )

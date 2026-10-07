@@ -18,9 +18,33 @@ type user_option = { id : int; name : string }
 type message = {
   id : int;
   creator_id : int;
+  client_message_id : string;
   creator_name : string;
   body_html : string;
   created_at : string;
+}
+type boost = {
+  id : int;
+  message_id : int;
+  booster_id : int;
+  booster_name : string;
+  content : string;
+  created_at : string;
+}
+type message_attachment = {
+  message_id : int;
+  blob_id : int;
+  key : string;
+  filename : string;
+  content_type : string;
+  byte_size : int;
+}
+type stored_blob = {
+  id : int;
+  key : string;
+  filename : string;
+  content_type : string;
+  byte_size : int;
 }
 type search_result = { message : message; room_id : int; room_name : string }
 
@@ -942,7 +966,7 @@ let messages_for_room ?before ?after ?around database room_id =
   Option.fold ~none:[]
     ~some:(fun db ->
       let select =
-        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at,m.creator_id FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=?"
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at,m.creator_id,m.client_message_id FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=?"
       in
       let pivot message_id =
         with_statement db
@@ -973,6 +997,7 @@ let messages_for_room ?before ?after ?around database room_id =
                 Some
                   { id = Sqlite3.column_int statement 0;
                     creator_id = Sqlite3.column_int statement 4;
+                    client_message_id = Sqlite3.column_text statement 5;
                     creator_name = Sqlite3.column_text statement 1;
                     body_html = Sqlite3.column_text statement 2;
                     created_at = Sqlite3.column_text statement 3 }
@@ -998,6 +1023,7 @@ let messages_for_room ?before ?after ?around database room_id =
                   collect
                     ({ id = Sqlite3.column_int statement 0;
                        creator_id = Sqlite3.column_int statement 4;
+                       client_message_id = Sqlite3.column_text statement 5;
                        creator_name = Sqlite3.column_text statement 1;
                        body_html = Sqlite3.column_text statement 2;
                        created_at = Sqlite3.column_text statement 3 }
@@ -1033,6 +1059,237 @@ let messages_for_room ?before ?after ?around database room_id =
           | None, None -> latest ()))
     database
 
+let boosts_for_messages database messages =
+  match database with
+  | None -> []
+  | Some _ when messages = [] -> []
+  | Some db ->
+      let message_ids = List.map (fun (message : message) -> message.id) messages in
+      let placeholders = List.map (fun _ -> "?") message_ids |> String.concat "," in
+      with_statement db
+        ("SELECT b.id,b.message_id,b.booster_id,u.name,b.content,b.created_at "
+        ^ "FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN ("
+        ^ placeholders ^ ") ORDER BY b.created_at,b.id")
+        (fun statement ->
+          List.iteri
+            (fun index id ->
+              check_rc db "bind boosted message id" (Sqlite3.bind_int statement (index + 1) id))
+            message_ids;
+          let rec collect boosts =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                let boost =
+                  { id = Sqlite3.column_int statement 0;
+                    message_id = Sqlite3.column_int statement 1;
+                    booster_id = Sqlite3.column_int statement 2;
+                    booster_name = Sqlite3.column_text statement 3;
+                    content = Sqlite3.column_text statement 4;
+                    created_at = Sqlite3.column_text statement 5 }
+                in
+                collect (boost :: boosts)
+            | Sqlite3.Rc.DONE -> List.rev boosts
+            | error ->
+                failwith
+                  (Printf.sprintf "message boost lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []
+          |> List.fold_left
+               (fun grouped (boost : boost) ->
+                 let previous = List.assoc_opt boost.message_id grouped |> Option.value ~default:[] in
+                 let grouped = List.remove_assoc boost.message_id grouped in
+                 grouped @ [ (boost.message_id, previous @ [ boost ]) ])
+               [])
+
+let room_id_for_message_user database ~message_id ~user_id =
+  Option.bind database (fun db ->
+      with_statement db
+        "SELECT m.room_id FROM messages m JOIN memberships ms ON ms.room_id=m.room_id WHERE m.id=? AND ms.user_id=? LIMIT 1"
+        (fun statement ->
+          check_rc db "bind reachable message id" (Sqlite3.bind_int statement 1 message_id);
+          check_rc db "bind reachable message user" (Sqlite3.bind_int statement 2 user_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW -> Some (Sqlite3.column_int statement 0)
+          | Sqlite3.Rc.DONE -> None
+          | error ->
+              failwith
+                (Printf.sprintf "reachable message lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let create_boost database ~message_id ~booster_id ~content ~timestamp =
+  Option.bind database (fun db ->
+      with_statement db
+        "INSERT INTO boosts(message_id,booster_id,content,created_at,updated_at) VALUES(?,?,?,?,?)"
+        (fun statement ->
+          check_rc db "bind boost message" (Sqlite3.bind_int statement 1 message_id);
+          check_rc db "bind boost author" (Sqlite3.bind_int statement 2 booster_id);
+          check_rc db "bind boost content" (Sqlite3.bind_text statement 3 content);
+          check_rc db "bind boost created time" (Sqlite3.bind_text statement 4 timestamp);
+          check_rc db "bind boost updated time" (Sqlite3.bind_text statement 5 timestamp);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE ->
+              with_statement db "SELECT last_insert_rowid()" (fun id_statement ->
+                  match Sqlite3.step id_statement with
+                  | Sqlite3.Rc.ROW -> Some (Sqlite3.column_int id_statement 0)
+                  | _ -> None)
+          | error ->
+              failwith
+                (Printf.sprintf "boost insert failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let delete_boost database ~boost_id ~message_id ~booster_id =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      with_statement db
+        "DELETE FROM boosts WHERE id=? AND message_id=? AND booster_id=?"
+        (fun statement ->
+          check_rc db "bind boost id" (Sqlite3.bind_int statement 1 boost_id);
+          check_rc db "bind boost message" (Sqlite3.bind_int statement 2 message_id);
+          check_rc db "bind boost author" (Sqlite3.bind_int statement 3 booster_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE -> Sqlite3.changes db = 1
+          | error ->
+              failwith
+                (Printf.sprintf "boost deletion failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+    database
+
+let attachments_for_messages database messages =
+  match database with
+  | None -> []
+  | Some _ when messages = [] -> []
+  | Some db ->
+      let message_ids = List.map (fun (message : message) -> message.id) messages in
+      let placeholders = List.map (fun _ -> "?") message_ids |> String.concat "," in
+      with_statement db
+        ("SELECT a.record_id,b.id,b.key,b.filename,b.content_type,b.byte_size "
+        ^ "FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id=a.blob_id "
+        ^ "WHERE a.record_type='Message' AND a.name='attachment' AND a.record_id IN ("
+        ^ placeholders ^ ")")
+        (fun statement ->
+          List.iteri
+            (fun index id ->
+              check_rc db "bind attached message id"
+                (Sqlite3.bind_int statement (index + 1) id))
+            message_ids;
+          let rec collect attachments =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                collect
+                  ((Sqlite3.column_int statement 0,
+                    { message_id = Sqlite3.column_int statement 0;
+                      blob_id = Sqlite3.column_int statement 1;
+                      key = Sqlite3.column_text statement 2;
+                      filename = Sqlite3.column_text statement 3;
+                      content_type = Sqlite3.column_text statement 4;
+                      byte_size = Sqlite3.column_int statement 5 })
+                   :: attachments)
+            | Sqlite3.Rc.DONE -> List.rev attachments
+            | error ->
+                failwith
+                  (Printf.sprintf "message attachment lookup failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect [])
+
+let find_stored_blob database blob_id =
+  Option.bind database (fun db ->
+      with_statement db
+        "SELECT id,key,filename,COALESCE(content_type,'application/octet-stream'),byte_size FROM active_storage_blobs WHERE id=? LIMIT 1"
+        (fun statement ->
+          check_rc db "bind stored blob id" (Sqlite3.bind_int statement 1 blob_id);
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.ROW ->
+              Some
+                { id = Sqlite3.column_int statement 0;
+                  key = Sqlite3.column_text statement 1;
+                  filename = Sqlite3.column_text statement 2;
+                  content_type = Sqlite3.column_text statement 3;
+                  byte_size = Sqlite3.column_int statement 4 }
+          | Sqlite3.Rc.DONE -> None
+          | error ->
+              failwith
+                (Printf.sprintf "stored blob lookup failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+
+let authorized_stored_blob database ~blob_id ~user_id =
+  Option.fold ~none:false
+    ~some:(fun db ->
+      with_statement db
+        "SELECT a.record_type,a.record_id,b.metadata FROM active_storage_blobs b LEFT JOIN active_storage_attachments a ON a.blob_id=b.id WHERE b.id=?"
+        (fun statement ->
+          check_rc db "bind authorized blob id" (Sqlite3.bind_int statement 1 blob_id);
+          let rec collect has_attachment authorized metadata =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                let record_type = Sqlite3.column_text statement 0 in
+                let record_id = Sqlite3.column_int statement 1 in
+                let metadata = Sqlite3.column_text statement 2 in
+                let allowed =
+                  match record_type with
+                  | "User" | "Account" -> true
+                  | "Message" ->
+                      exists db
+                        (Printf.sprintf
+                           "SELECT 1 FROM messages m JOIN memberships ms ON ms.room_id=m.room_id WHERE m.id=%d AND ms.user_id=%d LIMIT 1"
+                           record_id user_id)
+                  | "ActionText::RichText" ->
+                      exists db
+                        (Printf.sprintf
+                           "SELECT 1 FROM action_text_rich_texts rt JOIN messages m ON m.id=rt.record_id JOIN memberships ms ON ms.room_id=m.room_id WHERE rt.id=%d AND rt.record_type='Message' AND ms.user_id=%d LIMIT 1"
+                           record_id user_id)
+                  | _ -> false
+                in
+                collect true (authorized || allowed) metadata
+            | Sqlite3.Rc.DONE ->
+                if has_attachment then authorized
+                else
+                  (try
+                     match Yojson.Basic.from_string metadata with
+                     | `Assoc fields ->
+                         (match List.assoc_opt "campfire_upload_user_id" fields with
+                         | None | Some `Null -> true
+                         | Some (`Int owner) -> owner = user_id
+                         | Some (`String owner) -> int_of_string_opt owner = Some user_id
+                         | _ -> false)
+                     | _ -> true
+                   with _ -> true)
+            | error ->
+                failwith
+                  (Printf.sprintf "stored blob authorization failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect false false "{}"))
+    database
+
+let messages_after_id database room_id message_id =
+  Option.fold ~none:[]
+    ~some:(fun db ->
+      with_statement db
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at,m.creator_id,m.client_message_id FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=? AND m.id>? ORDER BY m.id ASC LIMIT 100"
+        (fun statement ->
+          check_rc db "bind live-message room" (Sqlite3.bind_int statement 1 room_id);
+          check_rc db "bind live-message cursor" (Sqlite3.bind_int statement 2 message_id);
+          let rec collect messages =
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.ROW ->
+                collect
+                  ({ id = Sqlite3.column_int statement 0;
+                     creator_name = Sqlite3.column_text statement 1;
+                     body_html = Sqlite3.column_text statement 2;
+                     created_at = Sqlite3.column_text statement 3;
+                     creator_id = Sqlite3.column_int statement 4;
+                     client_message_id = Sqlite3.column_text statement 5 }
+                  :: messages)
+            | Sqlite3.Rc.DONE -> List.rev messages
+            | error ->
+                failwith
+                  (Printf.sprintf "live-message query failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))
+          in
+          collect []))
+    database
+
 let has_messages_before database room_id message_id =
   Option.fold ~none:false
     ~some:(fun db ->
@@ -1063,9 +1320,9 @@ let has_messages_after database room_id message_id =
           | _ -> false))
     database
 
-let create_message database ~room_id ~creator_id ~body ~client_message_id ~timestamp =
-  Option.iter
-    (fun db ->
+let create_message_with_id ?attachment_blob_id database ~room_id ~creator_id ~body
+    ~client_message_id ~timestamp =
+  Option.fold ~none:None ~some:(fun db ->
       let run sql =
         match Sqlite3.exec db sql with
         | Sqlite3.Rc.OK -> ()
@@ -1131,6 +1388,24 @@ let create_message database ~room_id ~creator_id ~body ~client_message_id ~times
                 failwith
                   (Printf.sprintf "rich text insert failed (%s): %s"
                      (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        Option.iter
+          (fun blob_id ->
+            with_statement db
+              "INSERT INTO active_storage_attachments(name,record_type,record_id,blob_id,created_at) VALUES('attachment','Message',?,?,?)"
+              (fun statement ->
+                check_rc db "bind attached message id"
+                  (Sqlite3.bind_int statement 1 message_id);
+                check_rc db "bind attached blob id"
+                  (Sqlite3.bind_int statement 2 blob_id);
+                check_rc db "bind attachment timestamp"
+                  (Sqlite3.bind_text statement 3 timestamp);
+                match Sqlite3.step statement with
+                | Sqlite3.Rc.DONE -> ()
+                | error ->
+                    failwith
+                      (Printf.sprintf "message attachment insert failed (%s): %s"
+                         (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+          attachment_blob_id;
         with_statement db
           "INSERT INTO message_search_index(rowid,body) VALUES(?,?)"
           (fun statement ->
@@ -1144,16 +1419,96 @@ let create_message database ~room_id ~creator_id ~body ~client_message_id ~times
                 failwith
                   (Printf.sprintf "message search insert failed (%s): %s"
                      (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
-        run "COMMIT"
+        (* Match Room#receive: only visible memberships which are not currently
+           connected become unread, and a message never marks its author unread. *)
+        with_statement db
+          "UPDATE memberships SET unread_at=?,updated_at=? WHERE room_id=? AND user_id<>? AND COALESCE(involvement,'')<>'invisible' AND (connected_at IS NULL OR datetime(connected_at)<datetime(?,'-60 seconds'))"
+          (fun statement ->
+            List.iteri
+              (fun index value ->
+                check_rc db "bind unread membership update"
+                  (Sqlite3.bind_text statement (index + 1) value))
+              [ timestamp; timestamp; string_of_int room_id;
+                string_of_int creator_id; timestamp ];
+            match Sqlite3.step statement with
+            | Sqlite3.Rc.DONE -> ()
+            | error ->
+                failwith
+                  (Printf.sprintf "unread membership update failed (%s): %s"
+                     (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db)));
+        run "COMMIT";
+        Some message_id
       with error ->
         (try run "ROLLBACK" with _ -> ());
         raise error)
     database
 
+let membership_present database ~room_id ~user_id ~timestamp =
+  Option.fold ~none:false ~some:(fun db ->
+      with_statement db
+        "UPDATE memberships SET connections=CASE WHEN connected_at IS NOT NULL AND datetime(connected_at)>=datetime(?,'-60 seconds') THEN connections+1 ELSE 1 END,connected_at=?,unread_at=NULL,updated_at=? WHERE room_id=? AND user_id=?"
+        (fun statement ->
+          List.iteri
+            (fun index value ->
+              check_rc db "bind membership presence"
+                (Sqlite3.bind_text statement (index + 1) value))
+            [ timestamp; timestamp; timestamp; string_of_int room_id;
+              string_of_int user_id ];
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE -> Sqlite3.changes db = 1
+          | error ->
+              failwith
+                (Printf.sprintf "membership presence failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+    database
+
+let membership_absent database ~room_id ~user_id ~timestamp =
+  Option.fold ~none:false ~some:(fun db ->
+      with_statement db
+        "UPDATE memberships SET connections=CASE WHEN connected_at IS NOT NULL AND datetime(connected_at)>=datetime(?,'-60 seconds') THEN MAX(connections-1,0) ELSE 0 END,connected_at=CASE WHEN connected_at IS NOT NULL AND datetime(connected_at)>=datetime(?,'-60 seconds') AND connections>1 THEN ? ELSE NULL END,updated_at=? WHERE room_id=? AND user_id=?"
+        (fun statement ->
+          List.iteri
+            (fun index value ->
+              check_rc db "bind membership absence"
+                (Sqlite3.bind_text statement (index + 1) value))
+            [ timestamp; timestamp; timestamp; timestamp;
+              string_of_int room_id; string_of_int user_id ];
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE -> Sqlite3.changes db = 1
+          | error ->
+              failwith
+                (Printf.sprintf "membership absence failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+    database
+
+let membership_refresh database ~room_id ~user_id ~timestamp =
+  Option.fold ~none:false ~some:(fun db ->
+      with_statement db
+        "UPDATE memberships SET connections=CASE WHEN connected_at IS NOT NULL AND datetime(connected_at)>=datetime(?,'-60 seconds') THEN connections ELSE 1 END,connected_at=?,updated_at=? WHERE room_id=? AND user_id=?"
+        (fun statement ->
+          List.iteri
+            (fun index value ->
+              check_rc db "bind membership refresh"
+                (Sqlite3.bind_text statement (index + 1) value))
+            [ timestamp; timestamp; timestamp; string_of_int room_id;
+              string_of_int user_id ];
+          match Sqlite3.step statement with
+          | Sqlite3.Rc.DONE -> Sqlite3.changes db = 1
+          | error ->
+              failwith
+                (Printf.sprintf "membership refresh failed (%s): %s"
+                   (Sqlite3.Rc.to_string error) (Sqlite3.errmsg db))))
+    database
+
+let create_message database ~room_id ~creator_id ~body ~client_message_id ~timestamp =
+  ignore
+    (create_message_with_id database ~room_id ~creator_id ~body ~client_message_id
+       ~timestamp)
+
 let find_message database room_id message_id =
   Option.bind database (fun db ->
       with_statement db
-        "SELECT m.id,m.creator_id,u.name,COALESCE(rt.body,''),m.created_at FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=? AND m.id=? LIMIT 1"
+        "SELECT m.id,m.creator_id,u.name,COALESCE(rt.body,''),m.created_at,m.client_message_id FROM messages m JOIN users u ON u.id=m.creator_id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE m.room_id=? AND m.id=? LIMIT 1"
         (fun statement ->
           check_rc db "bind message room" (Sqlite3.bind_int statement 1 room_id);
           check_rc db "bind message id" (Sqlite3.bind_int statement 2 message_id);
@@ -1164,7 +1519,8 @@ let find_message database room_id message_id =
                   creator_id = Sqlite3.column_int statement 1;
                   creator_name = Sqlite3.column_text statement 2;
                   body_html = Sqlite3.column_text statement 3;
-                  created_at = Sqlite3.column_text statement 4 }
+                  created_at = Sqlite3.column_text statement 4;
+                  client_message_id = Sqlite3.column_text statement 5 }
           | Sqlite3.Rc.DONE -> None
           | error ->
               failwith
@@ -1494,7 +1850,7 @@ let search_messages database user_id fts_query =
   Option.fold ~none:[]
     ~some:(fun db ->
       with_statement db
-        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at,r.name,m.room_id,m.creator_id FROM messages m JOIN rooms r ON r.id=m.room_id JOIN users u ON u.id=m.creator_id JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? JOIN message_search_index idx ON idx.rowid=m.id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE idx.body MATCH ? ORDER BY m.created_at DESC,m.id DESC LIMIT 100"
+        "SELECT m.id,u.name,COALESCE(rt.body,''),m.created_at,r.name,m.room_id,m.creator_id,m.client_message_id FROM messages m JOIN rooms r ON r.id=m.room_id JOIN users u ON u.id=m.creator_id JOIN memberships ms ON ms.room_id=m.room_id AND ms.user_id=? JOIN message_search_index idx ON idx.rowid=m.id LEFT JOIN action_text_rich_texts rt ON rt.record_type='Message' AND rt.record_id=m.id AND rt.name='body' WHERE idx.body MATCH ? ORDER BY m.created_at ASC,m.id ASC LIMIT 100"
         (fun statement ->
           check_rc db "bind search membership user"
             (Sqlite3.bind_int statement 1 user_id);
@@ -1506,6 +1862,7 @@ let search_messages database user_id fts_query =
                 let message =
                   { id = Sqlite3.column_int statement 0;
                     creator_id = Sqlite3.column_int statement 6;
+                    client_message_id = Sqlite3.column_text statement 7;
                     creator_name = Sqlite3.column_text statement 1;
                     body_html = Sqlite3.column_text statement 2;
                     created_at = Sqlite3.column_text statement 3 }

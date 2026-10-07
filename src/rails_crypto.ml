@@ -2,6 +2,7 @@ external pbkdf2_sha256 : string -> string -> int -> int -> string
   = "campfire_pbkdf2_sha256"
 
 external hmac : int -> string -> string -> string = "campfire_hmac"
+external sha1 : string -> string = "campfire_sha1"
 external random_bytes : int -> string = "campfire_random_bytes"
 external aes_256_gcm_encrypt : string -> string -> string -> string
   = "campfire_aes_256_gcm_encrypt"
@@ -271,11 +272,61 @@ let verify_user_avatar_id ~secret raw =
               | _ -> None
             with _ -> None))
 
+let sign_user_avatar_id ~secret user_id =
+  let payload =
+    Yojson.Basic.to_string
+      (`Assoc
+        [ ("_rails", `Assoc
+             [ ("data", `Int user_id); ("pur", `String "user/avatar") ]) ])
+    |> base64url_encode
+  in
+  let signing_key = derive_key secret "active_record/signed_id" 64 in
+  payload ^ "--" ^ (hmac 2 signing_key payload |> hex)
+
+let sign_active_storage_blob_id ~secret blob_id =
+  let payload =
+    Yojson.Basic.to_string
+      (`Assoc
+        [ ("_rails", `Assoc [ ("data", `Int blob_id); ("pur", `String "blob_id") ]) ])
+    |> base64_encode
+  in
+  let signing_key = derive_key secret "ActiveStorage" 64 in
+  payload ^ "--" ^ (hmac 1 signing_key payload |> hex)
+
+let verify_active_storage_blob_id ~secret signed_id =
+  Option.bind (split_signature signed_id) (fun (payload, signature) ->
+      let signing_key = derive_key secret "ActiveStorage" 64 in
+      let expected = hmac 1 signing_key payload |> hex in
+      if not (constant_time_equal signature expected) then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `Assoc [ ("_rails", `Assoc fields) ] ->
+                  (match (List.assoc_opt "data" fields, List.assoc_opt "pur" fields) with
+                  | Some (`Int id), Some (`String "blob_id") when id > 0 -> Some id
+                  | _ -> None)
+              | _ -> None
+            with _ -> None))
+
 let sign_turbo_stream_name ~secret stream_name =
   let payload = Yojson.Basic.to_string (`String stream_name) |> base64_encode in
   let key = derive_key secret "turbo/signed_stream_verifier_key" 64 in
   let signature = hmac 2 key payload |> hex in
   payload ^ "--" ^ signature
+
+let verify_turbo_stream_name ~secret signed_name =
+  Option.bind (split_signature signed_name) (fun (payload, signature) ->
+      let key = derive_key secret "turbo/signed_stream_verifier_key" 64 in
+      let expected = hmac 2 key payload |> hex in
+      if not (constant_time_equal signature expected) then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `String stream_name -> Some stream_name
+              | _ -> None
+            with _ -> None))
 
 let encrypt_cookie ~secret ~name ?expires_at ?nonce value =
   let nonce = Option.value nonce ~default:(random_bytes 12) in

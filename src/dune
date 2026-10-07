@@ -9,7 +9,7 @@
 (library
  (name campfire_oxcaml_core)
  (wrapped false)
- (modules bcrypt database rails_crypto session)
+ (modules bcrypt database cable_bus rails_crypto session websocket)
  (foreign_stubs
   (language c)
   (flags
@@ -21,7 +21,7 @@
   -L/opt/homebrew/opt/openssl@3/lib
   -L/usr/local/opt/openssl@3/lib
   -lcrypto)
- (libraries sqlite3 yojson unix))
+ (libraries sqlite3 yojson unix cstruct eio))
 
 (test
  (name database_test)
@@ -32,3 +32,13 @@
  (name rails_crypto_test)
  (modules rails_crypto_test)
  (libraries campfire_oxcaml_core))
+
+(test
+ (name websocket_test)
+ (modules websocket_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name cable_bus_test)
+ (modules cable_bus_test)
+ (libraries campfire_oxcaml_core eio_main))

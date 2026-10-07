@@ -253,9 +253,105 @@ let message_edit_form (user : Database.user) csrf room_id
   ^ html_escape csrf ^ "\"><label>Message<textarea name=\"message[body]\" required maxlength=\"10000\">"
   ^ body ^ "</textarea></label><button type=\"submit\">Save changes</button></form></main></body></html>"
 
-let room_page (user : Database.user) (rooms : Database.room list)
+let encode_path_component value =
+  let output = Buffer.create (String.length value) in
+  let hexadecimal = "0123456789ABCDEF" in
+  String.iter
+    (fun character ->
+      if
+        (character >= 'a' && character <= 'z')
+        || (character >= 'A' && character <= 'Z')
+        || (character >= '0' && character <= '9')
+        || String.contains "-_.~" character
+      then Buffer.add_char output character
+      else (
+        let value = Char.code character in
+        Buffer.add_char output '%';
+        Buffer.add_char output hexadecimal.[value lsr 4];
+        Buffer.add_char output hexadecimal.[value land 15]))
+    value;
+  Buffer.contents output
+
+let render_boost ~secret (boost : Database.boost) =
+  let avatar_token =
+    Rails_crypto.sign_user_avatar_id ~secret boost.Database.booster_id
+    |> encode_path_component
+  in
+  "<div id=\"boost_" ^ string_of_int boost.Database.id
+  ^ "\" class=\"boost boost-item\"><img aria-label=\""
+  ^ html_escape (boost.Database.booster_name ^ " boosted " ^ boost.Database.content)
+  ^ "\" src=\"/users/" ^ avatar_token ^ "/avatar\" width=\"24\" height=\"24\"><span>"
+  ^ html_escape boost.Database.content ^ "</span></div>"
+
+let active_storage_blob_url ~secret (attachment : Database.message_attachment) =
+  let signed_id =
+    Rails_crypto.sign_active_storage_blob_id ~secret attachment.Database.blob_id
+  in
+  "/rails/active_storage/blobs/redirect/" ^ signed_id ^ "/"
+  ^ encode_path_component attachment.Database.filename
+
+let render_message_attachment ~secret (attachment : Database.message_attachment) =
+  let url = active_storage_blob_url ~secret attachment in
+  let filename = html_escape attachment.Database.filename in
+  if String.starts_with ~prefix:"image/" attachment.Database.content_type then
+    "<a href=\"" ^ url
+    ^ "\" data-lightbox-target=\"image\"><img class=\"message__attachment\" src=\""
+    ^ url ^ "\" alt=\"" ^ filename ^ "\" loading=\"lazy\"></a>"
+  else if String.starts_with ~prefix:"video/" attachment.Database.content_type then
+    "<video src=\"" ^ url
+    ^ "\" controls class=\"message__attachment\"></video>"
+  else
+    "<a href=\"" ^ url ^ "?disposition=attachment\">" ^ filename ^ "</a>"
+
+let render_message_item ~secret ?(room_name = "") ?(boosts = [])
+    ?(attachments = [])
+    (user : Database.user) room_id csrf (message : Database.message) =
+  let avatar_token =
+    Rails_crypto.sign_user_avatar_id ~secret message.Database.creator_id
+    |> encode_path_component
+  in
+  let permalink =
+    "/rooms/" ^ string_of_int room_id ^ "/@"
+    ^ string_of_int message.Database.id
+  in
+  let actions =
+    if user.Database.role = 1 || user.Database.id = message.Database.creator_id then
+      let path =
+        "/rooms/" ^ string_of_int room_id ^ "/messages/"
+        ^ string_of_int message.Database.id
+      in
+      "<a href=\"" ^ path ^ "/edit\">Edit</a><form action=\"" ^ path
+      ^ "\" method=\"post\" style=\"display:inline\"><input type=\"hidden\" name=\"_method\" value=\"delete\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+      ^ html_escape csrf ^ "\"><button type=\"submit\">Delete</button></form>"
+    else ""
+  in
+  "<div id=\"message_" ^ html_escape message.Database.client_message_id
+  ^ "\" class=\"message\" data-message-id=\""
+  ^ string_of_int message.Database.id
+  ^ "\"><h2 class=\"message__day-separator\"><time>"
+  ^ html_escape message.Database.created_at
+  ^ "</time></h2><figure class=\"avatar message__avatar\"><img aria-hidden=\"true\" src=\"/users/"
+  ^ avatar_token
+  ^ "/avatar\" width=\"48\" height=\"48\"></figure><article class=\"message__body\"><header><strong class=\"message__author\">"
+  ^ html_escape message.Database.creator_name
+  ^ "</strong><a class=\"message__permalink\" href=\"" ^ permalink
+  ^ "\"><time class=\"message__timestamp\" datetime=\""
+  ^ html_escape message.Database.created_at ^ "\">"
+  ^ html_escape message.Database.created_at
+  ^ "</time></a><span class=\"message__room\"><a href=\"/rooms/"
+  ^ string_of_int room_id ^ "\">" ^ html_escape room_name
+  ^ "</a></span><div class=\"message__actions\">" ^ actions
+  ^ "</div></header><div class=\"message__presentation\"><div class=\"message-body\">"
+  ^ safe_message_body message.Database.body_html
+  ^ (attachments |> List.map (render_message_attachment ~secret) |> String.concat "")
+  ^ "</div><div class=\"boosts\" id=\"boosts_message_"
+  ^ html_escape message.Database.client_message_id ^ "\">"
+  ^ (boosts |> List.map (render_boost ~secret) |> String.concat "")
+  ^ "</div></div></article></div>"
+
+let room_page ~secret (user : Database.user) (rooms : Database.room list)
     (current : Database.room) csrf (messages : Database.message list)
-    ~older_messages ~newer_messages ~room_stream =
+    ~boosts_by_message ~attachments_by_message ~older_messages ~newer_messages ~room_stream =
   let links =
     rooms
     |> List.map (fun (room : Database.room) ->
@@ -265,7 +361,7 @@ let room_page (user : Database.user) (rooms : Database.room list)
   in
   "<!doctype html><html><head><meta charset=\"utf-8\"><title>"
   ^ html_escape current.Database.name
-  ^ " · Campfire</title><link rel=\"stylesheet\" href=\"/assets/campfire.css\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
+  ^ " · Campfire</title><link rel=\"stylesheet\" href=\"/assets/campfire.css\"><link rel=\"icon\" href=\"/assets/campfire.png\" type=\"image/png\"><link rel=\"mask-icon\" href=\"/assets/campfire.svg\"><script type=\"importmap\">{\"imports\":{\"application\":\"/assets/application.js\"}}</script><link rel=\"modulepreload\" href=\"/assets/application.js\"><meta name=\"csrf-param\" content=\"authenticity_token\"><meta name=\"csrf-token\" content=\""
   ^ html_escape csrf
   ^ "\"></head><body><nav><a href=\"/\">Campfire</a> <a href=\"/searches\">Search</a><p>"
   ^ "<a href=\"/users/me/profile\">" ^ html_escape user.Database.name ^ "</a>"
@@ -296,28 +392,16 @@ let room_page (user : Database.user) (rooms : Database.room list)
        ^ (if current.Database.kind = "Rooms::Direct" then "Delete conversation" else "Delete room")
        ^ "</button></form>"
      else "")
-  ^ "<section aria-label=\"Messages\"><ol>"
+  ^ "<section aria-label=\"Messages\"><ol id=\"room_"
+  ^ string_of_int current.Database.id ^ "_messages\">"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
-           let actions =
-             if user.Database.role = 1 || user.Database.id = message.Database.creator_id
-             then
-               let path =
-                 "/rooms/" ^ string_of_int current.Database.id ^ "/messages/"
-                 ^ string_of_int message.Database.id
-               in
-               " <a href=\"" ^ path ^ "/edit\">Edit</a><form action=\"" ^ path
-               ^ "\" method=\"post\" style=\"display:inline\"><input type=\"hidden\" name=\"_method\" value=\"delete\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
-               ^ html_escape csrf ^ "\"><button type=\"submit\">Delete</button></form>"
-             else ""
-           in
-           "<li id=\"message-" ^ string_of_int message.Database.id
-           ^ "\" data-message-id=\"" ^ string_of_int message.Database.id
-           ^ "\"><article><header><strong>" ^ html_escape message.Database.creator_name
-           ^ "</strong> <time>" ^ html_escape message.Database.created_at
-           ^ "</time></header><div class=\"message-body\">"
-           ^ safe_message_body message.Database.body_html ^ "</div>" ^ actions
-           ^ "</article></li>")
+           render_message_item ~secret ~room_name:current.Database.name
+             ~boosts:(List.assoc_opt message.Database.id boosts_by_message
+               |> Option.value ~default:[]) user
+             ~attachments:(List.assoc_opt message.Database.id attachments_by_message
+               |> Option.to_list)
+             current.Database.id csrf message)
     |> String.concat "")
   ^ "</ol></section><turbo-cable-stream-source channel=\"RoomMessagesChannel\" signed-stream-name=\""
   ^ html_escape room_stream
@@ -350,6 +434,30 @@ let direct_room_id_of_path path =
 let avatar_token_of_path path =
   match String.split_on_char '/' path with
   | [ ""; "users"; token; "avatar" ] when token <> "" -> Some token
+  | _ -> None
+
+let active_storage_blob_id_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "rails"; "active_storage"; "blobs"; "redirect"; signed_id; _filename ] ->
+      Some signed_id
+  | _ -> None
+
+let boost_collection_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "messages"; message_id; "boosts" ] -> int_of_string_opt message_id
+  | _ -> None
+
+let boost_new_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "messages"; message_id; "boosts"; "new" ] -> int_of_string_opt message_id
+  | _ -> None
+
+let boost_member_of_path path =
+  match String.split_on_char '/' path with
+  | [ ""; "messages"; message_id; "boosts"; boost_id ] ->
+      Option.bind (int_of_string_opt message_id) (fun message_id ->
+          Option.map (fun boost_id -> (message_id, boost_id))
+            (int_of_string_opt boost_id))
   | _ -> None
 
 let room_message_collection_id path =
@@ -635,9 +743,9 @@ let create_join_user_request database remote_ip secret headers path body =
   in
   if not (valid_origin headers)
      || not (Session.valid_csrf ~path ~method_:"POST" session authenticity_token)
-  then
+  then (
     html_with_session ~secret session `Unprocessable_entity
-      "<!doctype html><html><body>Unprocessable request</body></html>"
+      "<!doctype html><html><body>Unprocessable request</body></html>")
   else
     match current_identity database secret headers with
     | Some _ -> redirect "/"
@@ -695,7 +803,15 @@ let create_join_user_request database remote_ip secret headers path body =
                        ~error:"Campfire could not create your account."
                        code session.Session.csrf_form_token))
 
-let submit_message database secret headers room_id body =
+let contains_substring ~needle value =
+  let needle_length = String.length needle in
+  let rec find index =
+    index + needle_length <= String.length value
+    && (String.sub value index needle_length = needle || find (index + 1))
+  in
+  find 0
+
+let submit_message message_bus database secret headers room_id body =
   let session = load_session secret headers in
   let form = parse_form body in
   let authenticity_token =
@@ -704,6 +820,12 @@ let submit_message database secret headers room_id body =
     | None -> form_value form "authenticity_token"
   in
   let path = "/rooms/" ^ string_of_int room_id ^ "/messages" in
+  let accepts_turbo_stream =
+    Cohttp.Header.get headers "accept"
+    |> Option.value ~default:""
+    |> String.lowercase_ascii
+    |> contains_substring ~needle:"text/vnd.turbo-stream.html"
+  in
   if not (valid_origin headers)
      || not (Session.valid_csrf ~path ~method_:"POST" session authenticity_token)
   then
@@ -717,18 +839,63 @@ let submit_message database secret headers room_id body =
            Database.find_room_for_user database identity.Database.user.id room_id
          with
         | None -> response `Not_found "Room not found or inaccessible"
-        | Some _ ->
+        | Some room ->
             let content = namespaced_form_value form "message" "body" in
+            let attachment_token =
+              namespaced_form_value form "message" "attachment" |> trim
+            in
+            let attachment_blob_id =
+              Option.bind
+                (Rails_crypto.verify_active_storage_blob_id ~secret attachment_token)
+                (fun blob_id ->
+                  if Database.find_stored_blob database blob_id <> None
+                     && Database.authorized_stored_blob database ~blob_id
+                          ~user_id:identity.Database.user.id
+                  then Some blob_id
+                  else None)
+            in
             if String.trim content = "" || String.length content > 10_000 then
               response `Unprocessable_entity "Message must contain 1–10000 bytes"
+            else if attachment_token <> "" && attachment_blob_id = None then
+              response `Unprocessable_entity "Attachment is invalid or inaccessible"
             else
               try
-                Database.create_message database ~room_id
+                (match Database.create_message_with_id ?attachment_blob_id database ~room_id
                   ~creator_id:identity.Database.user.id ~body:content
                   ~client_message_id:(create_message_id ())
-                  ~timestamp:(timestamp_now ());
-                redirect ("/rooms/" ^ string_of_int room_id)
-              with _ -> response `Unprocessable_entity "Message could not be saved")
+                  ~timestamp:(timestamp_now ()) with
+                | Some message_id ->
+                    Option.iter
+                      (Cable_bus.publish message_bus ~room_id)
+                      (Database.find_message database room_id message_id);
+                    Database.room_member_ids database room_id
+                    |> List.iter (fun user_id ->
+                           Cable_bus.publish_unread message_bus ~user_id ~room_id);
+                    if accepts_turbo_stream then
+                      let message =
+                        Database.find_message database room_id message_id
+                        |> Option.get
+                      in
+                      let html =
+                        "<turbo-stream action=\"append\" target=\"room_"
+                        ^ string_of_int room_id ^ "_messages\"><template>"
+                        ^ render_message_item ~secret
+                            ~room_name:(room.Database.name)
+                            identity.Database.user room_id
+                            session.Session.csrf_form_token message
+                        ^ "</template></turbo-stream>"
+                      in
+                      let headers =
+                        Cohttp.Header.init_with "content-type"
+                          "text/vnd.turbo-stream.html; charset=utf-8"
+                      in
+                      html_with_session ~headers ~secret session `OK html
+                    else redirect ("/rooms/" ^ string_of_int room_id)
+                | None -> response `Service_unavailable "Campfire database is unavailable")
+              with error ->
+                prerr_endline
+                  ("benchmark message POST failed: " ^ Printexc.to_string error);
+                response `Unprocessable_entity "Message could not be saved")
 
 let edit_message_page database secret headers room_id message_id =
   match current_identity database secret headers with
@@ -749,7 +916,7 @@ let edit_message_page database secret headers room_id message_id =
                 (message_edit_form identity.Database.user
                    session.Session.csrf_form_token room_id message)))
 
-let mutate_message_request database secret headers room_id message_id method_
+let mutate_message_request message_bus database secret headers room_id message_id method_
     body =
   let session = load_session secret headers in
   let form = parse_form body in
@@ -782,11 +949,22 @@ let mutate_message_request database secret headers room_id message_id method_
                    ~user_id:identity.Database.user.id
                    ~role:identity.Database.user.role ~body:content
                    ~timestamp:(timestamp_now ());
+                 Option.iter (Cable_bus.publish_replace message_bus ~room_id)
+                   (Database.find_message database room_id message_id);
                  redirect path)
            | "DELETE" ->
+               let message_dom_id =
+                 Database.find_message database room_id message_id
+                 |> Option.map (fun (message : Database.message) ->
+                        "message_" ^ message.Database.client_message_id)
+               in
                Database.delete_message database ~room_id ~message_id
                  ~user_id:identity.Database.user.id
                  ~role:identity.Database.user.role;
+               Option.iter
+                 (fun message_dom_id ->
+                   Cable_bus.publish_remove message_bus ~room_id ~message_dom_id)
+                 message_dom_id;
                redirect ("/rooms/" ^ string_of_int room_id)
            | _ -> response `Method_not_allowed "Method not allowed")
          with
@@ -1061,6 +1239,10 @@ let room_response database secret headers room_id messages ~older_messages
       | None -> response `Not_found "Room not found or inaccessible"
       | Some room ->
           let session = load_session secret headers in
+          let boosts_by_message = Database.boosts_for_messages database messages in
+          let attachments_by_message =
+            Database.attachments_for_messages database messages
+          in
           let older_messages, newer_messages =
             match messages with
             | [] -> (false, false)
@@ -1081,9 +1263,10 @@ let room_response database secret headers room_id messages ~older_messages
               (room_gid ^ ":messages")
           in
           html_with_session ~secret session `OK
-            (room_page identity.Database.user
+            (room_page ~secret identity.Database.user
                (Database.rooms_for_user database identity.Database.user.id)
-               room session.Session.csrf_form_token messages ~older_messages
+               room session.Session.csrf_form_token messages ~boosts_by_message
+               ~attachments_by_message ~older_messages
                ~newer_messages ~room_stream))
 
 let sidebar_page database secret headers =
@@ -1174,6 +1357,96 @@ let read_avatar_file key =
         ~finally:(fun () -> close_in_noerr channel)
         (fun () -> Some (really_input_string channel (in_channel_length channel)))
     with _ -> None
+
+let read_storage_file = read_avatar_file
+
+let show_active_storage_blob database secret headers signed_id ~range ~attachment =
+  match current_identity database secret headers with
+  | None -> response `Unauthorized "Authentication required"
+  | Some identity ->
+  match
+    Option.bind (Rails_crypto.percent_decode signed_id)
+      (Rails_crypto.verify_active_storage_blob_id ~secret)
+  with
+  | None -> response `Not_found "Not found"
+  | Some blob_id ->
+      (match Database.find_stored_blob database blob_id with
+      | None -> response `Not_found "Not found"
+      | Some blob when not (Database.authorized_stored_blob database ~blob_id
+                             ~user_id:identity.Database.user.Database.id) ->
+          response `Forbidden "Forbidden"
+      | Some blob ->
+          (match read_storage_file blob.Database.key with
+          | None -> response `Not_found "Not found"
+          | Some body ->
+              let headers =
+                Cohttp.Header.init_with "content-type" blob.Database.content_type
+                |> fun headers -> Cohttp.Header.add headers "accept-ranges" "bytes"
+                |> fun headers ->
+                Cohttp.Header.add headers "content-disposition"
+                  (if attachment then
+                     "attachment; filename=\"" ^ blob.Database.filename ^ "\""
+                   else "inline; filename=\"" ^ blob.Database.filename ^ "\"")
+              in
+              let partial start finish =
+                let length = finish - start + 1 in
+                let partial_body = String.sub body start length in
+                let headers =
+                  headers
+                  |> fun headers ->
+                  Cohttp.Header.add headers "content-range"
+                    (Printf.sprintf "bytes %d-%d/%d" start finish (String.length body))
+                  |> fun headers ->
+                  Cohttp.Header.add headers "content-length" (string_of_int length)
+                in
+                response ~headers (Cohttp.Code.status_of_code 206) partial_body
+              in
+              let parse_range range =
+                match String.split_on_char '=' range with
+                | [ "bytes"; limits ] when not (String.contains limits ',') ->
+                    (match String.split_on_char '-' limits with
+                    | [ ""; suffix ] ->
+                        (match int_of_string_opt suffix with
+                        | Some suffix when suffix > 0 && body <> "" ->
+                            Some (max 0 (String.length body - suffix), String.length body - 1)
+                        | _ -> None)
+                    | [ first; "" ] ->
+                        (match int_of_string_opt first with
+                        | Some first when first >= 0 && first < String.length body ->
+                            Some (first, String.length body - 1)
+                        | _ -> None)
+                    | [ first; last ] ->
+                        (match (int_of_string_opt first, int_of_string_opt last) with
+                        | Some first, Some last
+                          when first >= 0 && first < String.length body && last >= first ->
+                            Some (first, min last (String.length body - 1))
+                        | _ -> None)
+                    | _ -> None)
+                | _ -> None
+              in
+              match range with
+              | Some range ->
+                  (match parse_range range with
+                  | Some (start, finish) -> partial start finish
+                  | None ->
+                      let headers =
+                        Cohttp.Header.add headers "content-range"
+                          (Printf.sprintf "bytes */%d" (String.length body))
+                      in
+                      response ~headers (Cohttp.Code.status_of_code 416) "")
+              | None -> response ~headers `OK body))
+
+let read_public_asset name =
+  let root =
+    Sys.getenv_opt "CAMPFIRE_ASSET_PATH"
+    |> Option.value ~default:(Filename.concat (Sys.getcwd ()) "assets")
+  in
+  try
+    let channel = open_in_bin (Filename.concat root name) in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr channel)
+      (fun () -> Some (really_input_string channel (in_channel_length channel)))
+  with _ -> None
 
 let show_avatar database secret path =
   match avatar_token_of_path path with
@@ -1478,7 +1751,137 @@ let update_involvement_request database secret headers room_id body =
             then redirect path
             else response `Unprocessable_entity "Invalid notification preference")
 
-let serve_request ~database ~jobs_database ~remote_ip request body =
+let boosts_page database secret headers message_id ~new_boost =
+  match current_identity database secret headers with
+  | None -> redirect "/session/new"
+  | Some identity ->
+      (match
+         Database.room_id_for_message_user database ~message_id
+           ~user_id:identity.Database.user.id
+       with
+      | None -> response `Not_found "Message not found"
+      | Some room_id ->
+          (match Database.find_message database room_id message_id with
+          | None -> response `Not_found "Message not found"
+          | Some message ->
+              let session = load_session secret headers in
+              let action = "/messages/" ^ string_of_int message_id ^ "/boosts" in
+              let content =
+                if new_boost then
+                  "<form id=\"new_boost_message_" ^ string_of_int message_id
+                  ^ "\" action=\"" ^ action
+                  ^ "\" method=\"post\"><input type=\"hidden\" name=\"authenticity_token\" value=\""
+                  ^ html_escape session.Session.csrf_form_token
+                  ^ "\"><label>Boost<textarea name=\"boost[content]\" required maxlength=\"500\"></textarea></label><button type=\"submit\">Boost</button></form>"
+                else
+                  let boosts =
+                    Database.boosts_for_messages database [ message ]
+                    |> List.assoc_opt message_id
+                    |> Option.value ~default:[]
+                  in
+                  "<main><h1>Boosts</h1>"
+                  ^ (boosts |> List.map (render_boost ~secret) |> String.concat "")
+                  ^ "</main>"
+              in
+              html_with_session ~secret session `OK
+                ("<!doctype html><html><head><meta name=\"csrf-token\" content=\""
+                ^ html_escape session.Session.csrf_form_token
+                ^ "\"></head><body>"
+                ^ (if new_boost then "" else "<a href=\"" ^ action ^ "/new\">New boost</a>")
+                ^ "<p>" ^ html_escape message.Database.body_html ^ "</p>" ^ content
+                ^ "</body></html>")))
+
+let mutate_boost_request database secret headers message_id boost_id method_ body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token = form_value form "authenticity_token" in
+  let path = "/messages/" ^ string_of_int message_id ^ "/boosts/" ^ string_of_int boost_id in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_ session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (match Database.room_id_for_message_user database ~message_id
+                 ~user_id:identity.Database.user.id with
+        | None -> response `Not_found "Message not found"
+        | Some _ ->
+            if method_ <> "DELETE" then response `Method_not_allowed "Method not allowed"
+            else if not (Database.delete_boost database ~boost_id ~message_id
+                           ~booster_id:identity.Database.user.id) then
+              response `Not_found "Boost not found"
+            else
+              let html =
+                "<turbo-stream action=\"remove\" target=\"boost_"
+                ^ string_of_int boost_id ^ "\"></turbo-stream>"
+              in
+              let response_headers =
+                Cohttp.Header.init_with "content-type"
+                  "text/vnd.turbo-stream.html; charset=utf-8"
+              in
+              html_with_session ~headers:response_headers ~secret session `OK html)
+
+let create_boost_request database secret headers message_id body =
+  let session = load_session secret headers in
+  let form = parse_form body in
+  let authenticity_token = form_value form "authenticity_token" in
+  let path = "/messages/" ^ string_of_int message_id ^ "/boosts" in
+  if not (valid_origin headers)
+     || not (Session.valid_csrf ~path ~method_:"POST" session authenticity_token)
+  then
+    html_with_session ~secret session `Unprocessable_entity
+      "<!doctype html><html><body>Unprocessable request</body></html>"
+  else
+    match current_identity database secret headers with
+    | None -> redirect "/session/new"
+    | Some identity ->
+        (match Database.room_id_for_message_user database ~message_id
+                 ~user_id:identity.Database.user.id with
+        | None -> response `Not_found "Message not found"
+        | Some room_id ->
+            let content = namespaced_form_value form "boost" "content" |> String.trim in
+            if content = "" || String.length content > 500 then
+              response `Unprocessable_entity "Boost must contain 1–500 bytes"
+            else
+              try
+                match Database.create_boost database ~message_id
+                        ~booster_id:identity.Database.user.id ~content
+                        ~timestamp:(timestamp_now ()) with
+                | None -> response `Service_unavailable "Campfire database is unavailable"
+                | Some boost_id ->
+                    let message =
+                      Database.find_message database room_id message_id |> Option.get
+                    in
+                    let card =
+                      Database.boosts_for_messages database [ message ]
+                      |> List.assoc_opt message_id
+                      |> Option.value ~default:[]
+                      |> List.find (fun (boost : Database.boost) -> boost.Database.id = boost_id)
+                      |> render_boost ~secret
+                    in
+                    if
+                      Cohttp.Header.get headers "accept"
+                      |> Option.value ~default:""
+                      |> String.lowercase_ascii
+                      |> contains_substring ~needle:"text/vnd.turbo-stream.html"
+                    then
+                      let html =
+                        "<turbo-stream action=\"append\" target=\"boosts_message_"
+                        ^ html_escape message.Database.client_message_id
+                        ^ "\"><template>" ^ card ^ "</template></turbo-stream>"
+                      in
+                      let response_headers =
+                        Cohttp.Header.init_with "content-type"
+                          "text/vnd.turbo-stream.html; charset=utf-8"
+                      in
+                      html_with_session ~headers:response_headers ~secret session `OK html
+                    else redirect path
+              with _ -> response `Unprocessable_entity "Boost could not be saved")
+
+let serve_request ~database ~jobs_database ~message_bus ~remote_ip request body =
   let path = path_of_request request in
   let headers = Cohttp.Request.headers request in
   match (Cohttp.Request.meth request, path) with
@@ -1489,6 +1892,26 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       response ~headers:(Cohttp.Header.init_with "content-type" "text/css; charset=utf-8")
         `OK
         ":root{color-scheme:light dark}body{margin:0;font-family:system-ui,sans-serif}.sidebar__container{display:flex;flex-direction:column;gap:.75rem}.room,.direct{display:flex;align-items:center;padding:.5rem;text-decoration:none}.unread{font-weight:700}"
+  | `GET, "/assets/application.js" ->
+      (match read_public_asset "application.js" with
+      | Some body ->
+          response
+            ~headers:(Cohttp.Header.init_with "content-type" "text/javascript; charset=utf-8")
+            `OK body
+      | None -> response `Not_found "Asset not found")
+  | `GET, "/assets/campfire.svg" ->
+      (match read_public_asset "campfire.svg" with
+      | Some body ->
+          response
+            ~headers:(Cohttp.Header.init_with "content-type" "image/svg+xml")
+            `OK body
+      | None -> response `Not_found "Asset not found")
+  | `GET, "/assets/campfire.png" ->
+      (match read_public_asset "campfire.png" with
+      | Some body ->
+          response ~headers:(Cohttp.Header.init_with "content-type" "image/png")
+            `OK body
+      | None -> response `Not_found "Asset not found")
   | `GET, join_path when join_code_of_path join_path <> None ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
@@ -1526,6 +1949,16 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
       | Some secret -> show_avatar database secret avatar_path)
+  | `GET, blob_path when active_storage_blob_id_of_path blob_path <> None ->
+      (match secret_key_base () with
+      | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | Some secret ->
+          show_active_storage_blob database secret
+            headers (Option.get (active_storage_blob_id_of_path blob_path))
+            ~range:(Cohttp.Header.get headers "range")
+            ~attachment:(
+              query_parameters request |> fun params ->
+              form_value params "disposition" = "attachment"))
   | `GET, "/users/me/profile" ->
       (match secret_key_base () with
       | None -> response `Internal_server_error "SECRET_KEY_BASE is required"
@@ -1722,6 +2155,42 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
             redirect
               ~headers:(attach_session_cookie (Cohttp.Header.init ()) ~secret session)
               "/first_run")
+  | `GET, boost_new_path when boost_new_of_path boost_new_path <> None ->
+      (match (secret_key_base (), boost_new_of_path boost_new_path) with
+      | Some secret, Some message_id -> boosts_page database secret headers message_id ~new_boost:true
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | `GET, boost_path when boost_collection_of_path boost_path <> None ->
+      (match (secret_key_base (), boost_collection_of_path boost_path) with
+      | Some secret, Some message_id -> boosts_page database secret headers message_id ~new_boost:false
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | (`POST | `DELETE), boost_member_path when boost_member_of_path boost_member_path <> None ->
+      (match (secret_key_base (), boost_member_of_path boost_member_path) with
+      | Some secret, Some (message_id, boost_id) ->
+          (try
+             let body = request_body body in
+             let method_ =
+               match Cohttp.Request.meth request with
+               | `DELETE -> "DELETE"
+               | `POST ->
+                   parse_form body |> fun form -> form_value form "_method"
+                   |> String.uppercase_ascii
+               | _ -> ""
+             in
+             mutate_boost_request database secret headers message_id boost_id method_ body
+           with Request_body_too_large -> response `Request_entity_too_large "Request body too large"
+              | _ -> response `Bad_request "Invalid boost request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
+  | `POST, boost_path when boost_collection_of_path boost_path <> None ->
+      (match (secret_key_base (), boost_collection_of_path boost_path) with
+      | Some secret, Some message_id ->
+          (try create_boost_request database secret headers message_id (request_body body)
+           with Request_body_too_large -> response `Request_entity_too_large "Request body too large"
+              | _ -> response `Bad_request "Invalid boost request")
+      | None, _ -> response `Internal_server_error "SECRET_KEY_BASE is required"
+      | _, None -> response `Not_found "Not found")
   | `GET, collection_path
     when room_message_collection_id collection_path <> None ->
       (match (secret_key_base (), room_message_collection_id collection_path) with
@@ -1810,7 +2279,7 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
                | `DELETE -> "DELETE"
                | _ -> "POST"
              in
-             mutate_message_request database secret headers room_id message_id
+             mutate_message_request message_bus database secret headers room_id message_id
                method_ body
            with
           | Request_body_too_large ->
@@ -1823,7 +2292,7 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
       | Some secret, Some room_id ->
           (try
              let request_body = request_body body in
-             submit_message database secret headers room_id request_body
+             submit_message message_bus database secret headers room_id request_body
            with
           | Request_body_too_large ->
               response `Request_entity_too_large "Request body too large"
@@ -1908,6 +2377,313 @@ let serve_request ~database ~jobs_database ~remote_ip request body =
               | _ -> response `Bad_request "Invalid form request"))
   | _ -> response `Not_found "Not found"
 
+let header_has_token headers name wanted =
+  Cohttp.Header.get_multi headers name
+  |> List.concat_map (String.split_on_char ',')
+  |> List.exists (fun value -> String.trim value |> String.lowercase_ascii = wanted)
+
+let cable_room_id database user_id channel signed_name secret =
+  match Rails_crypto.verify_turbo_stream_name ~secret signed_name with
+  | None -> None
+  | Some "rooms" when channel = "Turbo::StreamsChannel" -> Some `Sidebar
+  | Some stream_name
+    when channel = "Turbo::StreamsChannel" && String.ends_with ~suffix:":rooms" stream_name ->
+      let gid = String.sub stream_name 0 (String.length stream_name - 6) in
+      (match Rails_crypto.base64_decode gid |> Option.map (String.split_on_char '/') with
+      | Some [ "gid:"; ""; "campfire"; "User"; raw_id ]
+        when int_of_string_opt raw_id = Some user_id -> Some `Sidebar
+      | _ -> None)
+  | Some stream_name ->
+      let suffix = ":messages" in
+      if channel <> "RoomMessagesChannel" || not (String.ends_with ~suffix stream_name) then None
+      else
+        let gid = String.sub stream_name 0 (String.length stream_name - String.length suffix) in
+        Option.bind (Rails_crypto.base64_decode gid) (fun gid ->
+            match String.split_on_char '/' gid with
+            | [ "gid:"; ""; "campfire"; ("Rooms::Open" | "Rooms::Closed" | "Rooms::Direct"); raw_id ] ->
+                Option.bind (int_of_string_opt raw_id) (fun room_id ->
+                    Option.map (fun _ -> `Room room_id)
+                      (Database.find_room_for_user database user_id room_id))
+            | _ -> None)
+
+let cable_identifier identifier =
+  try
+    match Yojson.Basic.from_string identifier with
+    | `Assoc fields ->
+        (match List.assoc_opt "channel" fields with
+        | Some (`String ("RoomMessagesChannel" | "Turbo::StreamsChannel" as channel)) ->
+            Option.bind (List.assoc_opt "signed_stream_name" fields)
+              (function `String signed_name -> Some (channel, `Signed signed_name) | _ -> None)
+        | Some (`String "PresenceChannel") ->
+            Option.bind (List.assoc_opt "room_id" fields)
+              (function `Int room_id -> Some ("PresenceChannel", `Room_id room_id) | _ -> None)
+        | Some (`String ("UnreadRoomsChannel" | "ReadRoomsChannel" | "HeartbeatChannel" as channel)) ->
+            Some (channel, `No_params)
+        | _ -> None)
+    | _ -> None
+  with _ -> None
+
+let authorize_cable_subscription database identity secret (channel, params) =
+  match (channel, params) with
+  | ("RoomMessagesChannel" | "Turbo::StreamsChannel"), `Signed signed_name ->
+      cable_room_id database identity.Database.user.Database.id channel signed_name secret
+  | "PresenceChannel", `Room_id room_id ->
+      Option.map (fun _ -> `Presence room_id)
+        (Database.find_room_for_user database identity.Database.user.Database.id room_id)
+  | "UnreadRoomsChannel", `No_params ->
+      Some (`Unread identity.Database.user.Database.id)
+  | "ReadRoomsChannel", `No_params ->
+      Some (`Read identity.Database.user.Database.id)
+  | "HeartbeatChannel", `No_params -> Some `Control
+  | _ -> None
+
+let cable_websocket env database message_bus database_lock identity secret csrf ic oc =
+  let database_read f = Eio.Mutex.use_ro database_lock f in
+  let database_write f = Eio.Mutex.use_rw ~protect:true database_lock f in
+  let subscriptions = ref [] in
+  let events = Eio.Stream.create max_int in
+  let write_lock = Eio.Mutex.create () in
+  let write_frame opcode payload =
+    Eio.Mutex.use_rw ~protect:true write_lock (fun () ->
+        Eio.Buf_write.string oc (Websocket.encode_server_frame ~opcode payload);
+        Eio.Buf_write.flush oc)
+  in
+  let write_json json = write_frame 1 (Yojson.Basic.to_string json) in
+  let send_stream identifier html =
+    write_json
+      (`Assoc
+        [ ("identifier", `String identifier); ("message", `String html) ])
+  in
+  let room_name room_id =
+    database_read (fun () ->
+      Database.find_room_for_user database identity.Database.user.Database.id room_id)
+    |> Option.map (fun (room : Database.room) -> room.Database.name)
+    |> Option.value ~default:""
+  in
+  let subscribe identifier (channel, signed_name) =
+    match database_read (fun () ->
+      authorize_cable_subscription database identity secret (channel, signed_name)) with
+    | None ->
+        write_json
+          (`Assoc [ ("identifier", `String identifier); ("type", `String "reject_subscription") ])
+    | Some target ->
+        if not (List.exists (fun (known, _, _) -> known = identifier) !subscriptions) then
+          let subscription =
+            match target with
+            | `Sidebar -> None
+            | `Room room_id ->
+                Some
+                  (Cable_bus.subscribe message_bus ~room_id ~identifier ~queue:events)
+            | `Unread user_id ->
+                Some
+                  (Cable_bus.subscribe_unreads message_bus ~user_id ~identifier
+                     ~queue:events)
+            | `Read user_id ->
+                Some
+                  (Cable_bus.subscribe_reads message_bus ~user_id ~identifier
+                     ~queue:events)
+            | `Presence room_id ->
+                database_write (fun () ->
+                  ignore
+                    (Database.membership_present database ~room_id
+                       ~user_id:identity.Database.user.Database.id
+                       ~timestamp:(timestamp_now ())));
+                Cable_bus.publish_read message_bus
+                  ~user_id:identity.Database.user.Database.id ~room_id;
+        None
+            | `Control -> None
+          in
+          subscriptions := (identifier, target, subscription) :: !subscriptions;
+        write_json
+          (`Assoc [ ("identifier", `String identifier); ("type", `String "confirm_subscription") ])
+  in
+  let notify () =
+    while true do
+      match Eio.Stream.take events with
+      | Cable_bus.Message (identifier, room_id, (message : Database.message))
+        when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
+          let html =
+            "<turbo-stream action=\"append\" target=\"room_"
+            ^ string_of_int room_id ^ "_messages\"><template>"
+            ^ render_message_item ~secret ~room_name:(room_name room_id)
+                identity.Database.user room_id csrf message
+            ^ "</template></turbo-stream>"
+          in
+          send_stream identifier html
+      | Cable_bus.Replace (identifier, room_id, (message : Database.message))
+        when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
+      let html =
+            "<turbo-stream action=\"replace\" target=\"message_"
+            ^ html_escape message.Database.client_message_id ^ "\"><template>"
+            ^ render_message_item ~secret ~room_name:(room_name room_id)
+                identity.Database.user room_id csrf message
+            ^ "</template></turbo-stream>"
+          in
+          send_stream identifier html
+      | Cable_bus.Remove (identifier, message_dom_id)
+        when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
+          send_stream identifier
+            ("<turbo-stream action=\"remove\" target=\""
+            ^ html_escape message_dom_id ^ "\"></turbo-stream>")
+      | Cable_bus.Unread (identifier, room_id)
+        when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
+          write_json
+            (`Assoc
+              [ ("identifier", `String identifier);
+                ("message", `Assoc [ ("roomId", `Int room_id) ]) ])
+      | Cable_bus.Read (identifier, room_id)
+        when List.exists (fun (known, _, _) -> known = identifier) !subscriptions ->
+          write_json
+            (`Assoc
+              [ ("identifier", `String identifier);
+                ("message", `Assoc [ ("room_id", `Int room_id) ]) ])
+      | _ -> ()
+    done
+  in
+  let presence_action identifier action =
+    match List.find_opt (fun (known, _, _) -> known = identifier) !subscriptions with
+    | Some (_, `Presence room_id, _) ->
+        let user_id = identity.Database.user.Database.id in
+        let timestamp = timestamp_now () in
+        (match action with
+        | "present" ->
+            database_write (fun () ->
+              ignore (Database.membership_present database ~room_id ~user_id ~timestamp));
+            Cable_bus.publish_read message_bus ~user_id ~room_id
+        | "absent" ->
+            database_write (fun () ->
+              ignore (Database.membership_absent database ~room_id ~user_id ~timestamp))
+        | "refresh" ->
+            database_write (fun () ->
+              ignore (Database.membership_refresh database ~room_id ~user_id ~timestamp))
+        | _ -> ())
+    | _ -> ()
+  in
+  Eio.Switch.run (fun sw ->
+      write_json (`Assoc [ ("type", `String "welcome") ]);
+      Eio.Fiber.fork ~sw (fun () -> try notify () with _ -> ());
+      Eio.Fiber.fork ~sw (fun () ->
+          let rec heartbeat () =
+            Eio.Time.sleep env#clock 3.0;
+            write_json
+              (`Assoc
+                [ ("type", `String "ping");
+                  ("message", `Int (int_of_float (Unix.gettimeofday ()))) ]);
+            heartbeat ()
+          in
+          try heartbeat () with _ -> ());
+      let rec loop () =
+        let frame = Websocket.read_frame_buffered ic in
+        (match frame with
+        | { Websocket.opcode = 8; payload } ->
+            (try write_frame 8 payload with _ -> ());
+            raise Websocket.Closed
+        | { Websocket.opcode = 9; payload } -> write_frame 10 payload
+        | { Websocket.opcode = 10; _ } -> ()
+        | { Websocket.opcode = 1; payload } ->
+            (try
+               match Yojson.Basic.from_string payload with
+               | `Assoc fields ->
+                   (match (List.assoc_opt "command" fields, List.assoc_opt "identifier" fields) with
+                   | Some (`String "subscribe"), Some (`String identifier) ->
+                       (match cable_identifier identifier with
+                       | Some params -> subscribe identifier params
+                       | None ->
+                           write_json
+                             (`Assoc
+                               [ ("identifier", `String identifier);
+                                 ("type", `String "reject_subscription") ]))
+                   | Some (`String "unsubscribe"), Some (`String identifier) ->
+                       List.iter
+                         (fun (known, target, subscription) ->
+                           if known = identifier then (
+                             Option.iter Cable_bus.unsubscribe subscription;
+                             match target with
+                             | `Presence room_id ->
+                                 database_write (fun () ->
+                                   ignore
+                                     (Database.membership_absent database ~room_id
+                                        ~user_id:identity.Database.user.Database.id
+                                        ~timestamp:(timestamp_now ())))
+                             | _ -> ()))
+                         !subscriptions;
+                       subscriptions := List.filter (fun (known, _, _) -> known <> identifier) !subscriptions;
+                       write_json
+                         (`Assoc [ ("identifier", `String identifier); ("type", `String "confirm_unsubscription") ])
+                   | Some (`String "message"), Some (`String identifier) ->
+                       (match List.assoc_opt "data" fields with
+                       | Some (`String data) ->
+                           (try
+                              match Yojson.Basic.from_string data with
+                              | `Assoc payload ->
+                                  (match List.assoc_opt "action" payload with
+                                  | Some (`String action) -> presence_action identifier action
+                                  | _ -> ())
+                              | _ -> ()
+                            with _ -> ())
+                       | _ -> ())
+                   | _ -> ())
+               | _ -> ()
+             with error -> prerr_endline ("Action Cable command rejected: " ^ Printexc.to_string error))
+        | _ -> raise Websocket.Closed);
+        loop ()
+      in
+      Fun.protect
+        ~finally:(fun () ->
+          List.iter
+            (fun (_, target, subscription) ->
+              Option.iter Cable_bus.unsubscribe subscription;
+              match target with
+              | `Presence room_id ->
+                  database_write (fun () ->
+                    ignore
+                      (Database.membership_absent database ~room_id
+                         ~user_id:identity.Database.user.Database.id
+                         ~timestamp:(timestamp_now ())))
+              | _ -> ())
+            !subscriptions)
+        (fun () -> try loop () with _ -> ()))
+
+let serve_cable ~env ~database ~message_bus ~database_lock ~secret request =
+  let headers = Cohttp.Request.headers request in
+  let invalid status body = `Response (response status body) in
+  let key = Cohttp.Header.get headers "sec-websocket-key" in
+  let version = Cohttp.Header.get headers "sec-websocket-version" in
+  let protocols = Cohttp.Header.get_multi headers "sec-websocket-protocol" in
+  let supports_actioncable =
+    protocols |> List.concat_map (String.split_on_char ',')
+    |> List.exists (fun protocol -> String.trim protocol = "actioncable-v1-json")
+  in
+  if Cohttp.Request.meth request <> `GET
+     || not (header_has_token headers "upgrade" "websocket")
+     || not (header_has_token headers "connection" "upgrade")
+     || version <> Some "13" || not supports_actioncable || not (valid_origin headers)
+  then invalid `Bad_request "Invalid Action Cable WebSocket upgrade"
+  else
+    match (key, current_identity database secret headers) with
+    | None, _ -> invalid `Bad_request "Missing WebSocket key"
+    | _, None -> invalid `Unauthorized "Authentication required"
+    | Some key, Some identity ->
+        (match Rails_crypto.base64_decode key with
+        | Some nonce when String.length nonce = 16 ->
+            let response_headers =
+              Cohttp.Header.of_list
+                [ ("upgrade", "websocket"); ("connection", "Upgrade");
+                  ("sec-websocket-accept", Websocket.websocket_accept key);
+                  ("sec-websocket-protocol", "actioncable-v1-json") ]
+            in
+            let response =
+              Cohttp.Response.make ~status:`Switching_protocols ~headers:response_headers ()
+            in
+            let session = load_session secret headers in
+            `Expert
+              (response, fun ic oc ->
+                try
+                  cable_websocket env database message_bus database_lock identity secret
+                    session.Session.csrf_form_token ic oc
+                with _ -> ())
+        | _ -> invalid `Bad_request "Invalid WebSocket key")
+
 let remote_ip = function
   | ((_, (`Tcp (address, _))), _) ->
       Format.asprintf "%a" Eio.Net.Ipaddr.pp address
@@ -1915,11 +2691,27 @@ let remote_ip = function
 
 let serve ~database ~jobs_database ~port ~domains =
   Eio_main.run (fun env ->
+      let message_bus = Cable_bus.create () in
+      let database_lock = Eio.Mutex.create () in
       let server =
-        Cohttp_eio.Server.make
+        Cohttp_eio.Server.make_response_action
           ~callback:(fun connection request body ->
-            serve_request ~database ~jobs_database
-              ~remote_ip:(remote_ip connection) request body)
+            if path_of_request request = "/cable" then
+              Eio.Mutex.use_ro database_lock (fun () ->
+                match secret_key_base () with
+                | None -> `Response (response `Internal_server_error "SECRET_KEY_BASE is required")
+                | Some secret ->
+                    serve_cable ~env ~database ~message_bus ~database_lock ~secret request)
+            else
+              let respond () =
+                `Response
+                  (serve_request ~database ~jobs_database ~message_bus
+                     ~remote_ip:(remote_ip connection) request body)
+              in
+              match Cohttp.Request.meth request with
+              | `GET | `HEAD ->
+                  Eio.Mutex.use_ro database_lock respond
+              | _ -> Eio.Mutex.use_rw ~protect:true database_lock respond)
           ()
       in
       Eio.Switch.run (fun sw ->

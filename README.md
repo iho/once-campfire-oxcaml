@@ -41,12 +41,21 @@ memberships transactionally, create/reuse participant-scoped direct conversation
 plain-text messages stored in Rails Action Text and FTS
 tables. The authenticated `/users/me/sidebar` endpoint renders visible shared rooms and
 direct conversations from Rails memberships, including unread indicators. Room pages expose
-benchmark message IDs and link a small native stylesheet for the shared HTTP preflight.
-Room and sidebar responses also expose Rails-signed Turbo stream names; the Cable transport
-is not implemented yet.
+benchmark message IDs and link the native stylesheet, importmap, app icon, module, and SVG
+asset endpoints checked by the shared HTTP preflight.
+Room message rendering also includes Rails-ordered boosts and attached message files. Active Storage
+blob redirects use Rails-signed IDs, require an authenticated session and room membership (or an
+account/user attachment), stream original bytes with byte-range support, and honor download
+disposition. Resized representations and upload flows are not implemented.
+Room and sidebar responses expose Rails-signed Turbo stream names. `/cable` accepts
+authenticated Action Cable WebSocket upgrades, validates signed room streams against current
+membership, tracks connection counts, clears unread state on presence, and sends committed
+room-message Turbo append/replace/remove events, user-scoped unread notifications, and
+user-scoped read-room events through an in-process Eio event bus. Sidebar refresh streams and
+reconnect/backpressure behavior remain incomplete.
 Authors and administrators can edit or delete text messages, with Action Text and
 FTS updated transactionally; edit/delete requests for messages with attachments are rejected
-until attachment storage is supported. Join-code invitations create member accounts, grant access to existing public
+because attachment lifecycle cleanup is incomplete. Join-code invitations create member accounts, grant access to existing public
 rooms, and start a session. Room creation honors the account's administrator-only setting.
 Search queries use the existing FTS index and retain the user's ten most recent
 searches. Message history supports 40-message older/newer cursors and room permalinks centered
@@ -58,24 +67,34 @@ members about every message; any participant can delete a direct conversation. R
 cleans text messages, boosts and search entries transactionally, but is rejected when the room
 contains attachments because storage cleanup is not implemented.
 Signed avatar URLs verify Rails Active Record IDs and return a local stored image or an
-initials SVG fallback. Avatar upload and optimized variants, rich formatting, message
-attachments, real-time delivery, and forwarded-HTTPS cookie handling are not implemented
-yet. Logout
+initials SVG fallback. Avatar upload and optimized variants, rich formatting, message attachment
+uploads/representations, remaining sidebar Cable streams, and
+forwarded-HTTPS cookie handling are not implemented yet. Logout
 deletes the session row and clears the signed cookie. Login attempts are limited to 10 per IP in three
 minutes using the separate `storage/db/jobs.sqlite3` database (or `JOBS_DATABASE_PATH`),
 leaving the Rails database schema untouched. The app uses Cohttp's Eio HTTP/1 server; direct
-TLS, HTTP/2 and Action Cable remain future work.
+TLS and HTTP/2 remain future work. A loopback raw-WebSocket smoke verified the shared
+benchmark's six subscriptions (Presence, UnreadRooms, Heartbeat, and the three scraped Turbo
+streams), and delivery of a marked message. A prior source revision passed the shared HTTP
+preflight against the Rails-generated canonical default seed. The current source was separately
+checked natively against a disposable copy of that seed for image/video/file Active Storage
+downloads, anonymous rejection and byte ranges; the full updated container preflight is pending.
+The shared Cable validator passed twice each at 100,
+500, and 1,000 clients, with six subscriptions per client and all 30 paced messages delivered
+to every client. Those runs used zero saturation time; throughput and a cross-implementation
+HTTP comparison remain unverified.
 
 Run the native SQLite, bcrypt and Rails cookie/CSRF checks with
 `opam exec --switch=5.2.0+ox -- dune runtest --profile=release`.
 
 ## Compatibility status
 
-No Rails compatibility or production-readiness claim is made yet. This is an early port:
-account/session authentication and the authenticated room/message feature set are partial,
-and production-database verification remains incomplete. The shared benchmark's canonical
-populated-seed preflight and Action Cable suite have not yet been run; Action Cable is not
-implemented.
+No full Rails compatibility or production-readiness claim is made yet. The authenticated
+feature set is partial, and production-database verification remains incomplete. Canonical
+seed HTTP preflight on a prior source revision and shared Action Cable delivery validation have
+passed; they do not establish comparative performance. Current-source attachment
+serving/auth/range behavior has native host verification, while the full updated container
+preflight and load/throughput comparison remain unverified.
 See
 [verification status](plans/contracts.md).
 

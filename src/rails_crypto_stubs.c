@@ -3,6 +3,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 #include <string.h>
 
 #include <caml/alloc.h>
@@ -53,6 +54,23 @@ CAMLprim value campfire_hmac(value algorithm, value key, value data) {
   output = caml_alloc_string(length);
   memcpy(Bytes_val(output), bytes, length);
   OPENSSL_cleanse(bytes, sizeof(bytes));
+  CAMLreturn(output);
+}
+
+CAMLprim value campfire_sha1(value data) {
+  CAMLparam1(data);
+  CAMLlocal1(output);
+  unsigned char digest[SHA_DIGEST_LENGTH];
+  unsigned int length = 0;
+  mlsize_t data_len = caml_string_length(data);
+  if (data_len > INT_MAX ||
+      EVP_Digest(String_val(data), data_len, digest, &length, EVP_sha1(), NULL) != 1 ||
+      length != SHA_DIGEST_LENGTH) {
+    fail_crypto();
+  }
+  output = caml_alloc_string(length);
+  memcpy(Bytes_val(output), digest, length);
+  OPENSSL_cleanse(digest, sizeof(digest));
   CAMLreturn(output);
 }
 

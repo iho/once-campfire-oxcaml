@@ -24,6 +24,9 @@ let () =
   in
   check "Rails Active Record avatar signed ID" (Some 1)
     (Rails_crypto.verify_user_avatar_id ~secret avatar_id);
+  let generated_avatar_id = Rails_crypto.sign_user_avatar_id ~secret 1 in
+  if generated_avatar_id <> avatar_id then
+    failwith ("generated Rails avatar signed ID: " ^ generated_avatar_id);
   check "avatar signed ID rejects another purpose" None
     (Rails_crypto.verify_user_avatar_id ~secret
        "eyJfcmFpbHMiOnsiZGF0YSI6MSwicHVyIjoidXNlciJ9fQ--ca0a5ac7b8763056751763399933da27f8551acad70d40c9be532b8b31e16c1b");
@@ -36,10 +39,30 @@ let () =
   check "avatar signed ID rejects tampering" None
     (Rails_crypto.verify_user_avatar_id ~secret
        (String.sub avatar_id 0 (String.length avatar_id - 1) ^ "0"));
+  let blob_secret = "independent-active-storage-vector" in
+  let blob_id =
+    "eyJfcmFpbHMiOnsiZGF0YSI6NDIsInB1ciI6ImJsb2JfaWQifX0=--5a6ee57cd0836e418a096599b48b2aae88b69be0"
+  in
+  check "Active Storage signed blob ID matches independent vector" blob_id
+    (Rails_crypto.sign_active_storage_blob_id ~secret:blob_secret 42);
+  check "Active Storage blob ID verifier checks signature and purpose" (Some 42)
+    (Rails_crypto.verify_active_storage_blob_id ~secret:blob_secret blob_id);
+  check "Active Storage blob ID verifier rejects tampering" None
+    (Rails_crypto.verify_active_storage_blob_id ~secret:blob_secret (blob_id ^ "x"));
   check "Rails Turbo room stream signing"
     "IloybGtPaTh2WTJGdGNHWnBjbVV2VW05dmJYTTZPazl3Wlc0dk1ROm1lc3NhZ2VzIg==--6ff497f9ec2f68f7ec64a5aee2fe25bd5ca8e2647ff82db8e211aabd83382b8b"
     (Rails_crypto.sign_turbo_stream_name ~secret
        "Z2lkOi8vY2FtcGZpcmUvUm9vbXM6Ok9wZW4vMQ:messages");
+  let signed_room_stream =
+    Rails_crypto.sign_turbo_stream_name ~secret
+      "Z2lkOi8vY2FtcGZpcmUvUm9vbXM6Ok9wZW4vMQ:messages"
+  in
+  check "Rails Turbo signed stream verification"
+    (Some "Z2lkOi8vY2FtcGZpcmUvUm9vbXM6Ok9wZW4vMQ:messages")
+    (Rails_crypto.verify_turbo_stream_name ~secret signed_room_stream);
+  check "Rails Turbo signed stream rejects tampering" None
+    (Rails_crypto.verify_turbo_stream_name ~secret
+       (String.sub signed_room_stream 0 (String.length signed_room_stream - 1) ^ "0"));
   check "Rails Turbo global rooms stream signing"
     "InJvb21zIg==--60a2ff565fb2226042c779b5711156db1d1cc48f89e6f59c94e4bf1da3f0945c"
     (Rails_crypto.sign_turbo_stream_name ~secret "rooms");
