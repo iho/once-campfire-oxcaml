@@ -90,6 +90,10 @@ let base64url_encode input =
   |> String.map (function '+' -> '-' | '/' -> '_' | character -> character)
   |> String.split_on_char '=' |> List.hd
 
+let base64url_encode_padded input =
+  base64_encode input
+  |> String.map (function '+' -> '-' | '/' -> '_' | character -> character)
+
 let percent_decode input =
   let length = String.length input in
   let hex character =
@@ -283,6 +287,42 @@ let sign_user_avatar_id ~secret user_id =
   let signing_key = derive_key secret "active_record/signed_id" 64 in
   payload ^ "--" ^ (hmac 2 signing_key payload |> hex)
 
+let sign_user_transfer_id ?expires_at ~secret user_id =
+  let expires_at =
+    Option.value expires_at
+      ~default:(iso_time_at (Unix.gettimeofday () +. (4. *. 60. *. 60.)))
+  in
+  let payload =
+    Yojson.Basic.to_string
+      (`Assoc
+        [ ("_rails", `Assoc
+             [ ("data", `Int user_id); ("exp", `String expires_at);
+               ("pur", `String "user/transfer") ]) ])
+    |> base64url_encode
+  in
+  let signing_key = derive_key secret "active_record/signed_id" 64 in
+  payload ^ "--" ^ (hmac 2 signing_key payload |> hex)
+
+let verify_user_transfer_id ~secret raw =
+  Option.bind (split_signature raw) (fun (payload, signature) ->
+      let signing_key = derive_key secret "active_record/signed_id" 64 in
+      let expected = hmac 2 signing_key payload |> hex in
+      if not (constant_time_equal signature expected) then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `Assoc [ ("_rails", `Assoc fields) ] ->
+                  (match (List.assoc_opt "data" fields,
+                         List.assoc_opt "exp" fields,
+                         List.assoc_opt "pur" fields) with
+                  | Some (`Int id), Some (`String expires_at),
+                    Some (`String "user/transfer")
+                    when id > 0 && expires_at > utc_now () -> Some id
+                  | _ -> None)
+              | _ -> None
+            with _ -> None))
+
 let sign_active_storage_blob_id ~secret blob_id =
   let payload =
     Yojson.Basic.to_string
@@ -305,6 +345,131 @@ let verify_active_storage_blob_id ~secret signed_id =
               | `Assoc [ ("_rails", `Assoc fields) ] ->
                   (match (List.assoc_opt "data" fields, List.assoc_opt "pur" fields) with
                   | Some (`Int id), Some (`String "blob_id") when id > 0 -> Some id
+                  | _ -> None)
+              | _ -> None
+            with _ -> None))
+
+type active_storage_variation = { format : string; width : int; height : int }
+
+let active_storage_variation_payload variation =
+  `Assoc
+    [ ( "_rails",
+        `Assoc
+          [ ( "data",
+              `Assoc
+                [ ("format", `String variation.format);
+                  ( "resize_to_limit",
+                    `List [ `Int variation.width; `Int variation.height ] ) ] );
+            ("pur", `String "variation") ] ) ]
+  |> json_encode |> base64_encode
+
+let sign_active_storage_variation ~secret variation =
+  let payload = active_storage_variation_payload variation in
+  payload ^ "--" ^ hmac_hex secret "ActiveStorage" payload
+
+let verify_active_storage_variation ~secret raw =
+  Option.bind (split_signature raw) (fun (payload, signature) ->
+      let expected = hmac_hex secret "ActiveStorage" payload in
+      if not (constant_time_equal signature expected) then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `Assoc [ ("_rails", `Assoc fields) ] ->
+                  (match
+                     ( List.assoc_opt "data" fields,
+                       List.assoc_opt "pur" fields )
+                   with
+                  | Some (`Assoc [ ("format", `String format);
+                                   ("resize_to_limit", `List [ `Int width; `Int height ]) ]),
+                    Some (`String "variation")
+                    when List.mem format [ "jpg"; "jpeg"; "png"; "webp" ]
+                         && width > 0 && width <= 16384
+                         && height > 0 && height <= 16384 ->
+                      Some { format; width; height }
+                  | _ -> None)
+              | _ -> None
+            with _ -> None))
+
+type disk_upload_token = {
+  key : string;
+  content_type : string;
+  content_length : int;
+  checksum : string;
+}
+
+let sign_active_storage_disk_upload ~secret ~key ~content_type ~content_length
+    ~checksum =
+  let expires_at = iso_time_at (Unix.gettimeofday () +. 300.) in
+  let value =
+    `Assoc [ ("key", `String key); ("content_type", `String content_type);
+             ("content_length", `Int content_length); ("checksum", `String checksum) ]
+  in
+  let payload =
+    `Assoc [ ("_rails", `Assoc [ ("data", value); ("exp", `String expires_at);
+                                  ("pur", `String "blob_token") ]) ]
+    |> json_encode |> base64_encode
+  in
+  let signing_key = derive_key secret "ActiveStorage" 64 in
+  payload ^ "--" ^ (hmac 1 signing_key payload |> hex)
+
+let verify_active_storage_disk_upload ~secret raw =
+  Option.bind (split_signature raw) (fun (payload, signature) ->
+      let signing_key = derive_key secret "ActiveStorage" 64 in
+      let expected = hmac 1 signing_key payload |> hex in
+      if not (constant_time_equal signature expected) then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `Assoc [ ("_rails", `Assoc fields) ] ->
+                  let field name = List.assoc_opt name fields in
+                  (match (field "data", field "exp", field "pur") with
+                  | Some (`Assoc values), Some (`String expires_at),
+                    Some (`String "blob_token") when expires_at > utc_now () ->
+                      let value name = List.assoc_opt name values in
+                      (match (value "key", value "content_type", value "content_length", value "checksum") with
+                      | Some (`String key), Some (`String content_type), Some (`Int content_length),
+                        Some (`String checksum)
+                        when content_length >= 0 && content_length <= 52_428_800 ->
+                          Some { key; content_type; content_length; checksum }
+                      | _ -> None)
+                  | _ -> None)
+              | _ -> None
+            with _ -> None))
+
+let sign_attachable_sgid ~secret ~model record_id =
+  let gid = Printf.sprintf "gid://campfire/%s/%d?expires_in" model record_id in
+  let payload =
+    `Assoc [ ("_rails", `Assoc [ ("data", `String gid); ("pur", `String "attachable") ]) ]
+    |> json_encode |> base64url_encode_padded
+  in
+  let signing_key = derive_key secret "signed_global_ids" 64 in
+  payload ^ "--" ^ (hmac 1 signing_key payload |> hex)
+
+let sign_active_storage_attachable_sgid ~secret blob_id =
+  sign_attachable_sgid ~secret ~model:"ActiveStorage::Blob" blob_id
+
+let verify_attachable_sgid ~secret ~model signed_id =
+  Option.bind (split_signature signed_id) (fun (payload, signature) ->
+      let signing_key = derive_key secret "signed_global_ids" 64 in
+      let expected = hmac 1 signing_key payload |> hex in
+      if not (constant_time_equal signature expected) then None
+      else
+        Option.bind (base64_decode payload) (fun decoded ->
+            try
+              match Yojson.Basic.from_string decoded with
+              | `Assoc [ ("_rails", `Assoc fields) ] ->
+                  (match (List.assoc_opt "data" fields, List.assoc_opt "pur" fields) with
+                  | Some (`String gid), Some (`String "attachable") ->
+                      let prefix = "gid://campfire/" ^ model ^ "/" in
+                      if not (String.starts_with ~prefix gid) then None
+                      else
+                        let suffix = String.sub gid (String.length prefix)
+                            (String.length gid - String.length prefix) in
+                        let id_text = List.hd (String.split_on_char '?' suffix) in
+                        Option.bind (int_of_string_opt id_text)
+                          (fun id -> if id > 0 then Some id else None)
                   | _ -> None)
               | _ -> None
             with _ -> None))

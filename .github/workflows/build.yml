@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,7 +19,8 @@ jobs:
       OPAMROOT: ${{ github.workspace }}/.opam-root
     steps:
       - uses: actions/checkout@v5
-        # The Rails reference submodule is not needed by the OxCaml build or tests.
+        with:
+          submodules: true
       - name: Cache OxCaml toolchain
         uses: actions/cache@v5
         with:
@@ -27,7 +31,7 @@ jobs:
       - name: Install system prerequisites
         run: |
           apt-get update
-          apt-get install -y autoconf build-essential ca-certificates git libsqlite3-dev libssl-dev opam pkg-config rsync
+          apt-get install -y autoconf build-essential ca-certificates git gzip libsqlite3-dev libssl-dev nodejs opam pkg-config rsync zlib1g-dev
       - name: Install OxCaml
         run: |
           opam init --disable-sandboxing --bare --yes
@@ -43,3 +47,42 @@ jobs:
         run: opam exec --switch=5.2.0+ox -- dune build --profile=release
       - name: Test
         run: opam exec --switch=5.2.0+ox -- dune runtest --profile=release
+      - name: Test browser Action Cable client
+        run: node --test tests/application-client.test.js
+      - name: Verify benchmark stylesheet parity
+        run: cmp assets/campfire.css reference/app/assets/stylesheets/_reset.css
+
+  production-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build production image and run native tests
+        run: docker build --tag once-campfire-oxcaml:test .
+      - name: Smoke-test production image
+        run: |
+          docker run --detach --rm --name once-campfire-oxcaml-ci \
+            --publish 127.0.0.1:18080:80 \
+            --tmpfs /rails/storage:mode=1777 \
+            --env SECRET_KEY_BASE=ci-only-not-a-real-secret \
+            once-campfire-oxcaml:test
+          trap 'docker stop once-campfire-oxcaml-ci >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/up >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if ! curl --fail --silent http://127.0.0.1:18080/up >/dev/null; then
+            docker logs once-campfire-oxcaml-ci
+            exit 1
+          fi
+          curl --fail --silent --show-error --compressed --dump-header /tmp/oxcaml-css-headers \
+            -H 'Accept-Encoding: gzip' http://127.0.0.1:18080/assets/campfire.css \
+            --output /tmp/oxcaml-campfire.css
+          grep -iq '^content-encoding: gzip' /tmp/oxcaml-css-headers
+          cmp assets/campfire.css /tmp/oxcaml-campfire.css
+          curl --fail --silent http://127.0.0.1:18080/webmanifest --output /tmp/oxcaml-webmanifest.json
+          grep -q '"display":"standalone"' /tmp/oxcaml-webmanifest.json
+          curl --fail --silent http://127.0.0.1:18080/service-worker --output /tmp/oxcaml-service-worker.js
+          grep -q 'notificationclick' /tmp/oxcaml-service-worker.js
+          docker logs once-campfire-oxcaml-ci

@@ -39,6 +39,22 @@ let () =
   check "avatar signed ID rejects tampering" None
     (Rails_crypto.verify_user_avatar_id ~secret
        (String.sub avatar_id 0 (String.length avatar_id - 1) ^ "0"));
+  let transfer_id =
+    "eyJfcmFpbHMiOnsiZGF0YSI6MSwiZXhwIjoiMjA0Ni0wMS0wMVQxMjowMDowMC4wMDBaIiwicHVyIjoidXNlci90cmFuc2ZlciJ9fQ--73f1bfd8e5a761a0b8fa7957f617abdd7ab01e432e5155e239da9d3c8779027d"
+  in
+  check "Rails transfer signed ID generation matches independent OpenSSL vector"
+    transfer_id
+    (Rails_crypto.sign_user_transfer_id
+       ~expires_at:"2046-01-01T12:00:00.000Z" ~secret 1);
+  check "Rails transfer signed ID verifies its purpose and expiry" (Some 1)
+    (Rails_crypto.verify_user_transfer_id ~secret transfer_id);
+  check "transfer signed ID rejects a different signed-ID purpose" None
+    (Rails_crypto.verify_user_transfer_id ~secret avatar_id);
+  check "transfer signed ID rejects tampering" None
+    (Rails_crypto.verify_user_transfer_id ~secret (transfer_id ^ "x"));
+  check "transfer signed ID rejects expiration" None
+    (Rails_crypto.verify_user_transfer_id ~secret
+       "eyJfcmFpbHMiOnsiZGF0YSI6MSwiZXhwIjoiMjAwMC0wMS0wMVQwMDowMDowMC4wMDBaIiwicHVyIjoidXNlci90cmFuc2ZlciJ9fQ--3197ece6b5022e1e31f939831f173a7cb803f43957fd6149845dfe36a746e2c1");
   let blob_secret = "independent-active-storage-vector" in
   let blob_id =
     "eyJfcmFpbHMiOnsiZGF0YSI6NDIsInB1ciI6ImJsb2JfaWQifX0=--5a6ee57cd0836e418a096599b48b2aae88b69be0"
@@ -47,8 +63,56 @@ let () =
     (Rails_crypto.sign_active_storage_blob_id ~secret:blob_secret 42);
   check "Active Storage blob ID verifier checks signature and purpose" (Some 42)
     (Rails_crypto.verify_active_storage_blob_id ~secret:blob_secret blob_id);
+  check "Active Storage signed blob ID generated token round trip" (Some 19)
+    (Rails_crypto.sign_active_storage_blob_id ~secret:blob_secret 19
+     |> Rails_crypto.verify_active_storage_blob_id ~secret:blob_secret);
   check "Active Storage blob ID verifier rejects tampering" None
     (Rails_crypto.verify_active_storage_blob_id ~secret:blob_secret (blob_id ^ "x"));
+  let variation =
+    "eyJfcmFpbHMiOnsiZGF0YSI6eyJmb3JtYXQiOiJqcGciLCJyZXNpemVfdG9fbGltaXQiOlsxMjAwLDgwMF19LCJwdXIiOiJ2YXJpYXRpb24ifX0=--167c4454bfaf9c46eed3049820a1d693a438771a"
+  in
+  let expected_variation : Rails_crypto.active_storage_variation =
+    { format = "jpg"; width = 1200; height = 800 }
+  in
+  let variation_secret = String.make 128 'a' in
+  check "Rails Active Storage variation verification matches independent vector"
+    (Some expected_variation)
+    (Rails_crypto.verify_active_storage_variation ~secret:variation_secret variation);
+  check "Rails Active Storage variation signing matches independent vector"
+    variation
+    (Rails_crypto.sign_active_storage_variation ~secret:variation_secret expected_variation);
+  check "Rails Active Storage variation rejects tampering" None
+    (Rails_crypto.verify_active_storage_variation ~secret:variation_secret
+       (variation ^ "x"));
+  let upload_token =
+    Rails_crypto.sign_active_storage_disk_upload ~secret:blob_secret ~key:"uploadkey1234"
+      ~content_type:"application/octet-stream" ~content_length:256
+      ~checksum:"dummysignedchecksum=="
+  in
+  check "Active Storage direct-upload token round trip"
+    (Some { Rails_crypto.key = "uploadkey1234";
+            content_type = "application/octet-stream"; content_length = 256;
+            checksum = "dummysignedchecksum==" })
+    (Rails_crypto.verify_active_storage_disk_upload ~secret:blob_secret upload_token);
+  check "Active Storage direct-upload token rejects tampering" None
+    (Rails_crypto.verify_active_storage_disk_upload ~secret:blob_secret
+       (let last = String.length upload_token - 1 in
+        String.sub upload_token 0 last
+        ^ (if upload_token.[last] = '0' then "1" else "0")));
+  check "Active Storage attachable GlobalID matches independent Rails-format vector"
+    "eyJfcmFpbHMiOnsiZGF0YSI6ImdpZDovL2NhbXBmaXJlL0FjdGl2ZVN0b3JhZ2U6OkJsb2IvNDI_ZXhwaXJlc19pbiIsInB1ciI6ImF0dGFjaGFibGUifX0=--cb65c31bf51fa4a3508e091f09fd22c82eb4e640"
+    (Rails_crypto.sign_active_storage_attachable_sgid ~secret:blob_secret 42);
+  check "User attachable GlobalID matches independent Rails-format vector"
+    "eyJfcmFpbHMiOnsiZGF0YSI6ImdpZDovL2NhbXBmaXJlL1VzZXIvNDI_ZXhwaXJlc19pbiIsInB1ciI6ImF0dGFjaGFibGUifX0=--e48ee53fbcf4307dbeaa9af5a09733f29768a579"
+    (Rails_crypto.sign_attachable_sgid ~secret:blob_secret ~model:"User" 42);
+  check "Rails signed User attachable GlobalID verifies"
+    (Some 42)
+    (Rails_crypto.verify_attachable_sgid ~secret:blob_secret ~model:"User"
+       "eyJfcmFpbHMiOnsiZGF0YSI6ImdpZDovL2NhbXBmaXJlL1VzZXIvNDI_ZXhwaXJlc19pbiIsInB1ciI6ImF0dGFjaGFibGUifX0=--e48ee53fbcf4307dbeaa9af5a09733f29768a579");
+  check "Rails signed attachable verifier rejects another model"
+    None
+    (Rails_crypto.verify_attachable_sgid ~secret:blob_secret ~model:"ActiveStorage::Blob"
+       "eyJfcmFpbHMiOnsiZGF0YSI6ImdpZDovL2NhbXBmaXJlL1VzZXIvNDI_ZXhwaXJlc19pbiIsInB1ciI6ImF0dGFjaGFibGUifX0=--e48ee53fbcf4307dbeaa9af5a09733f29768a579");
   check "Rails Turbo room stream signing"
     "IloybGtPaTh2WTJGdGNHWnBjbVV2VW05dmJYTTZPazl3Wlc0dk1ROm1lc3NhZ2VzIg==--6ff497f9ec2f68f7ec64a5aee2fe25bd5ca8e2647ff82db8e211aabd83382b8b"
     (Rails_crypto.sign_turbo_stream_name ~secret

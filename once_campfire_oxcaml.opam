@@ -17,6 +17,7 @@ depends: [
   "eio"
   "eio_main"
   "sqlite3"
+  "uri"
   "uring" {= "2.7.0" & os = "linux"}
   "yojson"
 ]

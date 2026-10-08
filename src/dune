@@ -4,24 +4,41 @@
  (name main)
  (public_name campfire-oxcaml)
  (modules main)
- (libraries campfire_oxcaml_core base cohttp-eio eio_main sqlite3 yojson))
+ (libraries campfire_oxcaml_core base cohttp-eio eio_main sqlite3 uri yojson))
 
 (library
  (name campfire_oxcaml_core)
  (wrapped false)
- (modules bcrypt database cable_bus rails_crypto session websocket)
+ (modules
+  action_text
+  attachment_presentation
+  bcrypt
+  database
+  forwarded_request
+  gzip
+  media_dimensions
+  multipart
+  opengraph
+  push_subscription
+  cable_bus
+  rails_crypto
+  session
+  timestamp
+  websocket
+  web_push)
  (foreign_stubs
   (language c)
   (flags
    (:standard
     -I/opt/homebrew/opt/openssl@3/include
     -I/usr/local/opt/openssl@3/include))
-  (names bcrypt_stubs rails_crypto_stubs bcrypt blf))
+  (names bcrypt_stubs gzip_stubs rails_crypto_stubs web_push_stubs bcrypt blf))
  (c_library_flags
   -L/opt/homebrew/opt/openssl@3/lib
   -L/usr/local/opt/openssl@3/lib
-  -lcrypto)
- (libraries sqlite3 yojson unix cstruct eio))
+  -lcrypto
+  -lz)
+ (libraries sqlite3 yojson unix cstruct eio uri))
 
 (test
  (name database_test)
@@ -29,9 +46,54 @@
  (libraries campfire_oxcaml_core sqlite3))
 
 (test
+ (name action_text_test)
+ (modules action_text_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name attachment_presentation_test)
+ (modules attachment_presentation_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name media_dimensions_test)
+ (modules media_dimensions_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name account_bot_test)
+ (modules account_bot_test)
+ (libraries campfire_oxcaml_core sqlite3))
+
+(test
+ (name multipart_test)
+ (modules multipart_test)
+ (libraries campfire_oxcaml_core))
+
+(test
  (name rails_crypto_test)
  (modules rails_crypto_test)
  (libraries campfire_oxcaml_core))
+
+(test
+ (name session_test)
+ (modules session_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name timestamp_test)
+ (modules timestamp_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name forwarded_request_test)
+ (modules forwarded_request_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name gzip_test)
+ (modules gzip_test)
+ (libraries campfire_oxcaml_core unix))
 
 (test
  (name websocket_test)
@@ -42,3 +104,18 @@
  (name cable_bus_test)
  (modules cable_bus_test)
  (libraries campfire_oxcaml_core eio_main))
+
+(test
+ (name push_subscription_test)
+ (modules push_subscription_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name opengraph_test)
+ (modules opengraph_test)
+ (libraries campfire_oxcaml_core))
+
+(test
+ (name web_push_test)
+ (modules web_push_test)
+ (libraries campfire_oxcaml_core))

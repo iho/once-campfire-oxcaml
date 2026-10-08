@@ -2,7 +2,7 @@ FROM debian:trixie-slim AS build
 
 ENV OPAMYES=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      autoconf build-essential ca-certificates git libsqlite3-dev libssl-dev opam pkg-config rsync \
+      autoconf build-essential ca-certificates git gzip libsqlite3-dev libssl-dev opam pkg-config rsync zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -21,7 +21,7 @@ RUN opam exec --switch=5.2.0+ox -- dune build --profile=release @all \
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates libsqlite3-0 libssl3 \
+      ca-certificates curl ffmpeg libsqlite3-0 libssl3 libvips-tools poppler-utils qrencode zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 campfire \
     && useradd --uid 1000 --gid campfire --create-home --home-dir /rails campfire \

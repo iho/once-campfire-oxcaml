@@ -120,7 +120,7 @@ let valid_csrf ?path ?method_ session token =
             candidates)
   | _ -> false
 
-let set_cookie ~secret session =
+let set_cookie ?(secure = false) ~secret session =
   if not session.dirty then None
   else
     let expires_at, expires_header = Rails_crypto.cookie_expiration () in
@@ -130,5 +130,5 @@ let set_cookie ~secret session =
     in
     Some
       (Printf.sprintf
-         "_campfire_session=%s; Path=/; Max-Age=631152000; Expires=%s; HttpOnly; SameSite=Lax"
-         value expires_header)
+         "_campfire_session=%s; Path=/; Max-Age=631152000; Expires=%s; HttpOnly; SameSite=Lax%s"
+         value expires_header (if secure then "; Secure" else ""))

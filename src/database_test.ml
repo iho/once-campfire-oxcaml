@@ -7,6 +7,21 @@ let exec db sql =
   | error -> failwith (Sqlite3.Rc.to_string error ^ ": " ^ Sqlite3.errmsg db)
 
 let () =
+  check "ban records accept public IPs and reject private/local IPs"
+    [true; false; false; false; true; false; false]
+    (List.map Database.public_ip_address
+       [ "203.0.113.1"; "127.0.0.1"; "10.0.0.1"; "169.254.1.1";
+         "2001:db8::1"; "fc00::1"; "fe80::1" ]);
+  let rich_body =
+    Action_text.sanitize
+      "<div>Hello <strong onclick=\"alert(1)\">Campfire</strong> <a href=\"javascript:alert(1)\">bad</a><a href=\"https://example.test/?a=1&amp;b=2\" onclick=\"alert(1)\">docs</a></div>"
+  in
+  if rich_body <> "<div>Hello <strong>Campfire</strong> bad<a href=\"https://example.test/?a=1&amp;b=2\">docs</a></div>" then
+    failwith ("Action Text formatting sanitizer: " ^ rich_body);
+  check "Action Text strips disallowed elements and event attributes"
+    "<div><em>safe</em>unsafe</div>"
+    (Action_text.sanitize
+       "<div><em>safe</em><img src=x onerror=alert(1)>unsafe</div>");
   let bcrypt_hash =
     "$2a$04$abcdefghijklmnopqrstuu0//9Hm2kfER85NNo0cY8vC7Rsrlx0Yi"
   in
@@ -31,7 +46,7 @@ let () =
     (fun () ->
       exec db "CREATE TABLE accounts (id INTEGER PRIMARY KEY)";
       exec db
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email_address TEXT, password_digest TEXT, role INTEGER DEFAULT 0, status INTEGER DEFAULT 0)";
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email_address TEXT, password_digest TEXT, role INTEGER DEFAULT 0, status INTEGER DEFAULT 0, bot_token TEXT)";
       exec db
         "CREATE TABLE sessions (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, ip_address TEXT, last_active_at TEXT NOT NULL, token TEXT NOT NULL, updated_at TEXT NOT NULL, user_agent TEXT, user_id INTEGER NOT NULL)";
       exec db
@@ -44,6 +59,18 @@ let () =
       exec db
         "INSERT INTO users(id,name,email_address,password_digest,role,status) VALUES(1,'David','david@example.com','$2a$04$abcdefghijklmnopqrstuu0//9Hm2kfER85NNo0cY8vC7Rsrlx0Yi',0,0)";
       check "existing user" true (Database.user_exists (Some db));
+      exec db
+        "INSERT INTO users(id,name,role,status,bot_token) VALUES(2,'Bender Bot',2,0,'abcDEF123456')";
+      check "active bot key authenticates exact active bot" (Some (2, "Bender Bot", 2))
+        (Database.authenticate_bot (Some db) "2-abcDEF123456"
+        |> Option.map (fun (bot : Database.user) -> (bot.id, bot.name, bot.role)));
+      check "bot token rejects wrong token" None
+        (Database.authenticate_bot (Some db) "2-abcDEF123457");
+      check "bot token rejects a non-bot user" None
+        (Database.authenticate_bot (Some db) "1-abcdefghijkl");
+      exec db "UPDATE users SET status=1 WHERE id=2";
+      check "bot token rejects deactivated bots" None
+        (Database.authenticate_bot (Some db) "2-abcDEF123456");
       check "active user lookup" (Some "David")
         (Database.find_active_user (Some db) "david@example.com"
         |> Option.map (fun (user : Database.user) -> user.Database.name));
@@ -76,9 +103,9 @@ let () =
     ~finally:(fun () -> ignore (Sqlite3.db_close setup_db))
     (fun () ->
       exec setup_db
-        "CREATE TABLE accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,join_code TEXT NOT NULL,settings TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,singleton_guard INTEGER NOT NULL DEFAULT 0 UNIQUE)";
+        "CREATE TABLE accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,join_code TEXT NOT NULL,settings TEXT,custom_styles TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,singleton_guard INTEGER NOT NULL DEFAULT 0 UNIQUE)";
       exec setup_db
-        "CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email_address TEXT UNIQUE,password_digest TEXT,bio TEXT,role INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+        "CREATE TABLE users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email_address TEXT UNIQUE,password_digest TEXT,bio TEXT,role INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,bot_token TEXT)";
       exec setup_db
         "CREATE TABLE rooms(id INTEGER PRIMARY KEY,name TEXT,type TEXT NOT NULL,creator_id INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
@@ -90,12 +117,20 @@ let () =
       exec setup_db
         "CREATE TABLE boosts(id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL,booster_id INTEGER NOT NULL,content TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
       exec setup_db
-        "CREATE TABLE active_storage_blobs(id INTEGER PRIMARY KEY,key TEXT NOT NULL,content_type TEXT,filename TEXT,byte_size INTEGER,metadata TEXT)";
+        "CREATE TABLE active_storage_blobs(id INTEGER PRIMARY KEY,key TEXT NOT NULL,content_type TEXT,filename TEXT,byte_size INTEGER,checksum TEXT,metadata TEXT,service_name TEXT,created_at TEXT)";
       exec setup_db
         "CREATE TABLE active_storage_attachments(id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,record_id INTEGER NOT NULL,name TEXT NOT NULL,blob_id INTEGER NOT NULL,created_at TEXT)";
       exec setup_db "CREATE VIRTUAL TABLE message_search_index USING fts5(body)";
       exec setup_db
         "CREATE TABLE searches(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,query TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE sessions(id INTEGER PRIMARY KEY,created_at TEXT NOT NULL,ip_address TEXT,last_active_at TEXT NOT NULL,token TEXT NOT NULL,updated_at TEXT NOT NULL,user_agent TEXT,user_id INTEGER NOT NULL)";
+      exec setup_db
+        "CREATE TABLE push_subscriptions(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,endpoint TEXT NOT NULL,p256dh_key TEXT,auth_key TEXT,user_agent TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE webhooks(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,url TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)";
+      exec setup_db
+        "CREATE TABLE bans(id INTEGER PRIMARY KEY,created_at TEXT NOT NULL,ip_address TEXT NOT NULL,updated_at TEXT NOT NULL,user_id INTEGER NOT NULL)";
       let password_digest = Bcrypt.hash "setup password" in
       check "generated bcrypt digest verifies" true
         (Bcrypt.verify ~hash:password_digest "setup password");
@@ -105,15 +140,143 @@ let () =
           ~timestamp:"2026-10-07 12:00:00.000"
         |> Option.get
       in
+      let join_code = Database.account_join_code (Some setup_db) |> Option.get in
+      check "account join-code lookup returns the original Rails value" true
+        (Database.valid_join_code (Some setup_db) join_code);
+      let push_id, created =
+        Database.register_push_subscription (Some setup_db) ~user_id
+          ~endpoint:"https://fcm.googleapis.com/send/test" ~p256dh_key:"public-key"
+          ~auth_key:"auth-key" ~user_agent:"Test Browser"
+          ~timestamp:"2026-10-07 12:00:00.000"
+        |> Option.get
+      in
+      check "push subscription inserts a Rails-shaped row" true created;
+      check "push subscription fields persist"
+        [ (push_id, "https://fcm.googleapis.com/send/test", "public-key", "auth-key", "Test Browser") ]
+        (Database.push_subscriptions (Some setup_db) ~user_id
+        |> List.map (fun (subscription : Database.push_subscription) ->
+             (subscription.id, subscription.endpoint, subscription.p256dh_key,
+              subscription.auth_key, subscription.user_agent)));
+      check "push subscription lookup scopes to its owner"
+        (Some (push_id, "https://fcm.googleapis.com/send/test"))
+        (Database.find_push_subscription (Some setup_db) ~user_id
+           ~subscription_id:push_id
+        |> Option.map (fun (subscription : Database.push_subscription) ->
+               (subscription.id, subscription.endpoint)));
+      check "push subscription lookup rejects another owner" None
+        (Database.find_push_subscription (Some setup_db) ~user_id:(user_id + 1)
+           ~subscription_id:push_id);
+      exec setup_db "UPDATE memberships SET unread_at='2026-10-07 12:00:00.000' WHERE user_id=1";
+      check "push badge counts unread memberships" 1
+        (Database.unread_membership_count (Some setup_db) ~user_id);
+      exec setup_db "UPDATE memberships SET unread_at=NULL WHERE user_id=1";
+      exec setup_db
+        "INSERT INTO users(id,name,email_address,created_at,updated_at) VALUES(50,'Everything','everything@example.com','2026-10-07','2026-10-07'),(51,'Mentioned','mentioned@example.com','2026-10-07','2026-10-07'),(52,'Invisible','invisible@example.com','2026-10-07','2026-10-07'),(53,'Just disconnected','disconnected@example.com','2026-10-07','2026-10-07'),(54,'Just connected','connected@example.com','2026-10-07','2026-10-07'); INSERT INTO memberships(room_id,user_id,involvement,created_at,updated_at,connected_at) VALUES(77,1,'everything','2026-10-07','2026-10-07',NULL),(77,50,'everything','2026-10-07','2026-10-07',NULL),(77,51,'mentions','2026-10-07','2026-10-07',NULL),(77,52,'invisible','2026-10-07','2026-10-07',NULL),(77,53,'everything','2026-10-07','2026-10-07','2026-10-07 11:59:00.100'),(77,54,'everything','2026-10-07','2026-10-07','2026-10-07 11:59:59.900'); INSERT INTO push_subscriptions(id,user_id,endpoint,created_at,updated_at) VALUES(50,50,'https://push.invalid/50','2026-10-07','2026-10-07'),(51,51,'https://push.invalid/51','2026-10-07','2026-10-07'),(52,52,'https://push.invalid/52','2026-10-07','2026-10-07'),(53,53,'https://push.invalid/53','2026-10-07','2026-10-07'),(54,54,'https://push.invalid/54','2026-10-07','2026-10-07')";
+      check "message push targets apply Rails involvement, visibility, disconnect and author rules"
+        [ (50,50); (51,51); (53,53) ]
+        (Database.message_push_targets (Some setup_db) ~room_id:77 ~creator_id:1
+           ~mentioned_user_ids:[51] ~timestamp:"2026-10-07 12:00:00.500"
+         |> List.map (fun (target : Database.message_push_target) ->
+              (target.user_id, target.subscription.id)));
+      exec setup_db
+        "DELETE FROM push_subscriptions WHERE id BETWEEN 50 AND 54; DELETE FROM memberships WHERE room_id=77; DELETE FROM users WHERE id BETWEEN 50 AND 54";
+      check "duplicate push subscription refreshes without duplicating" (Some (push_id, false))
+        (Database.register_push_subscription (Some setup_db) ~user_id
+          ~endpoint:"https://fcm.googleapis.com/send/test" ~p256dh_key:"public-key"
+          ~auth_key:"auth-key" ~user_agent:"Different Browser"
+          ~timestamp:"2026-10-07 12:01:00.000");
+      check "push subscription refresh retains original user agent" [ "Test Browser" ]
+        (Database.push_subscriptions (Some setup_db) ~user_id
+        |> List.map (fun (subscription : Database.push_subscription) -> subscription.user_agent));
+      check "push subscription deletion is owner scoped" false
+        (Database.delete_push_subscription (Some setup_db) ~user_id:(user_id + 1)
+          ~subscription_id:push_id);
+      check "push subscription owner can delete" true
+        (Database.delete_push_subscription (Some setup_db) ~user_id
+          ~subscription_id:push_id);
+      check "global autocomplete filters active users case-insensitively"
+        [ (user_id, "Ada Lovelace") ]
+        (Database.autocompletable_users (Some setup_db) ~room_id:None ~query:"ADA"
+        |> List.map (fun (user : Database.autocompletable_user) -> (user.id, user.name)));
+      check "room autocomplete is membership-scoped"
+        [ (user_id, "Ada Lovelace") ]
+        (Database.autocompletable_users (Some setup_db) ~room_id:(Some 1) ~query:"Ada"
+        |> List.map (fun (user : Database.autocompletable_user) -> (user.id, user.name)));
+      check "room autocomplete rejects users outside the room" []
+        (Database.autocompletable_users (Some setup_db) ~room_id:(Some 999) ~query:""
+        |> List.map (fun (user : Database.autocompletable_user) -> user.id));
       exec setup_db
         "INSERT INTO active_storage_blobs(id,key,content_type,filename,byte_size) VALUES(77,'abcdefgxyz','image/png','image.png',3)";
       exec setup_db
         "INSERT INTO active_storage_blobs(id,key,content_type,filename,byte_size) VALUES(78,'ghijklmnop','text/plain','attached.txt',3)";
       exec setup_db
+        "INSERT INTO active_storage_blobs(id,key,content_type,filename,byte_size) VALUES(79,'klmnopqrst','image/jpeg','attached.jpg',3)";
+      exec setup_db
         (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('User',%d,'avatar',77)" user_id);
+      let uploaded_avatar_id =
+        Database.create_stored_blob (Some setup_db) ~key:"newavatar80"
+          ~filename:"avatar.webp" ~content_type:"image/webp" ~byte_size:4
+          ~checksum:"AAAAAA=="
+          ~metadata:(Printf.sprintf "{\"campfire_upload_user_id\":%d}" user_id)
+          ~timestamp:"2026-10-07 12:00:00.400"
+        |> Option.get
+      in
+      check "stored upload inserts the Rails blob metadata"
+        (Some { Database.id = uploaded_avatar_id; key = "newavatar80";
+                filename = "avatar.webp"; content_type = "image/webp"; byte_size = 4 })
+        (Database.find_stored_blob (Some setup_db) uploaded_avatar_id);
+      check "unattached blob is attachable by its upload owner" true
+        (Database.authorized_stored_blob (Some setup_db) ~blob_id:uploaded_avatar_id
+           ~user_id);
+      check "unattached blob cannot be attached by another user" false
+        (Database.authorized_stored_blob (Some setup_db) ~blob_id:uploaded_avatar_id
+           ~user_id:(user_id + 1));
+      check "avatar replacement purges only the previous unshared blob"
+        [ "abcdefgxyz" ]
+        (Database.attach_avatar (Some setup_db) ~user_id ~blob_id:uploaded_avatar_id
+           ~timestamp:"2026-10-07 12:00:00.500");
       check "avatar lookup resolves the original Rails blob key and MIME type"
-        (Some { Database.key = "abcdefgxyz"; content_type = "image/png" })
+        (Some { Database.key = "newavatar80"; content_type = "image/webp" })
         (Database.find_avatar_blob (Some setup_db) user_id);
+      check "avatar destruction detaches and returns an orphan blob key"
+        [ "newavatar80" ] (Database.destroy_avatar (Some setup_db) user_id);
+      check "avatar destruction removes attachment and orphan blob rows" [ 0; 0 ]
+        (List.map
+           (fun sql ->
+             Database.with_statement setup_db sql (fun statement ->
+               ignore (Sqlite3.step statement);
+               Sqlite3.column_int statement 0))
+           [ "SELECT count(*) FROM active_storage_attachments WHERE record_type='User' AND record_id=" ^ string_of_int user_id ^ " AND name='avatar'";
+             "SELECT count(*) FROM active_storage_blobs WHERE id=80" ]);
+      let logo_one =
+        Database.create_stored_blob (Some setup_db) ~key:"accountlogoone"
+          ~filename:"logo-one.png" ~content_type:"image/png" ~byte_size:4
+          ~checksum:"AAAAAA==" ~metadata:"{}" ~timestamp:"2026-10-07"
+        |> Option.get
+      in
+      check "first account logo attachment has no previous orphan" []
+        (Database.attach_account_logo (Some setup_db) ~blob_id:logo_one
+           ~timestamp:"2026-10-07");
+      check "account logo lookup uses Rails Account/logo association"
+        (Some { Database.key = "accountlogoone"; content_type = "image/png" })
+        (Database.find_account_logo_blob (Some setup_db));
+      let logo_two =
+        Database.create_stored_blob (Some setup_db) ~key:"accountlogotwo"
+          ~filename:"logo-two.png" ~content_type:"image/png" ~byte_size:5
+          ~checksum:"AAAAAA==" ~metadata:"{}" ~timestamp:"2026-10-07"
+        |> Option.get
+      in
+      check "account logo replacement removes only the old orphan blob"
+        [ "accountlogoone" ]
+        (Database.attach_account_logo (Some setup_db) ~blob_id:logo_two
+           ~timestamp:"2026-10-07");
+      check "account logo destruction returns the orphan key" [ "accountlogotwo" ]
+        (Database.destroy_account_logo (Some setup_db) ~timestamp:"2026-10-07 12:00:02");
+      check "account logo destruction clears the association" None
+        (Database.find_account_logo_blob (Some setup_db));
+      check "account logo destruction touches account timestamp" "2026-10-07 12:00:02"
+        (Database.with_statement setup_db "SELECT updated_at FROM accounts WHERE id=1"
+           (fun statement -> ignore (Sqlite3.step statement); Sqlite3.column_text statement 0));
       exec setup_db
         "INSERT INTO users(id,name,email_address,password_digest,bio,role,status,created_at,updated_at) VALUES(99,'Inactive','duplicate@example.com',NULL,NULL,0,1,'2026-10-07','2026-10-07')";
       check "profile reads Rails profile fields" (Some ("Ada Lovelace", "ada@example.com", ""))
@@ -160,6 +323,8 @@ let () =
         (Database.with_statement setup_db "SELECT name FROM accounts" (fun statement ->
              ignore (Sqlite3.step statement);
              Sqlite3.column_text statement 0));
+      check "account name lookup" (Some "Campfire")
+        (Database.account_name (Some setup_db));
       check "first-run Rails join code format" true
         (Database.with_statement setup_db "SELECT join_code FROM accounts" (fun statement ->
              ignore (Sqlite3.step statement);
@@ -208,11 +373,19 @@ let () =
            ~timestamp:"2026-10-07 12:00:32.000");
       check "message creation returns its persisted ID" (Some 1)
         (Database.create_message_with_id (Some setup_db) ~room_id:1
-           ~creator_id:user_id ~body:"hello <script>&\nagain"
+           ~creator_id:user_id
+           ~body:"<div>hello <strong>rich</strong><script>alert(1)</script></div>"
            ~client_message_id:"00000000-0000-4000-8000-000000000001"
            ~timestamp:"2026-10-07 12:01:00.000");
       check "message reads through Rails Action Text" 1
         (Database.messages_for_room (Some setup_db) 1 |> List.length);
+      let created_since, updated_since =
+        Database.messages_changed_since (Some setup_db) 1 1_791_374_459_000L
+      in
+      check "incremental room refresh returns newly created messages" [ 1 ]
+        (List.map (fun (message : Database.message) -> message.id) created_since);
+      check "incremental room refresh does not duplicate new messages as edits" []
+        updated_since;
       exec setup_db
         (Printf.sprintf
            "INSERT INTO boosts(message_id,booster_id,content,created_at,updated_at) VALUES(1,%d,'👍','2026-10-07 12:02:00','2026-10-07 12:02:00')"
@@ -243,8 +416,8 @@ let () =
         |> List.map (fun (message : Database.message) -> message.Database.id));
       check "live-message cursor excludes previously delivered messages" []
         (Database.messages_after_id (Some setup_db) 1 1);
-      check "message text is escaped in Rails Action Text storage"
-        "<div>hello &lt;script&gt;&amp;</div><div>again</div>"
+      check "message creation stores sanitized rich Action Text"
+        "<div>hello <strong>rich</strong>alert(1)</div>"
         (Database.messages_for_room (Some setup_db) 1
         |> List.hd |> fun (message : Database.message) -> message.body_html);
       check "message is indexed for Rails search" 1
@@ -309,7 +482,14 @@ let () =
       Database.update_message (Some setup_db) ~room_id:1 ~message_id:1
         ~user_id:user_id ~role:1 ~body:"edited <b>message</b>"
         ~timestamp:"2026-10-07 12:02:31.000";
-      check "message edit stores escaped Action Text" "<div>edited &lt;b&gt;message&lt;/b&gt;</div>"
+      let created_since, updated_since =
+        Database.messages_changed_since (Some setup_db) 1 1_791_374_461_000L
+      in
+      check "incremental room refresh excludes old messages" []
+        (List.map (fun (message : Database.message) -> message.id) created_since);
+      check "incremental room refresh returns edited messages for replacement" [ 1 ]
+        (List.map (fun (message : Database.message) -> message.id) updated_since);
+      check "message edit stores allowlisted Action Text formatting" "<div>edited <b>message</b></div>"
         (Database.find_message (Some setup_db) 1 1
         |> Option.get |> fun (message : Database.message) -> message.body_html);
       check "message edit removes stale FTS terms" 0
@@ -453,9 +633,38 @@ let () =
            ~member_ids:[] ~timestamp:"2026-10-07 12:03:55.000"
         |> Option.get <> direct_room_id);
       exec setup_db
-        "UPDATE accounts SET settings='{\"restrict_room_creation_to_administrators\":true}'";
+        "UPDATE accounts SET settings='{\"custom_setting\":\"keep-me\",\"restrict_room_creation_to_administrators\":false}'";
+      check "account settings update succeeds" true
+        (Database.update_account (Some setup_db) ~name:(Some "Campfire Updated")
+           ~restrict_room_creation:(Some true) ~timestamp:"2026-10-07 12:03:58.000");
       check "account setting restricts room creation" true
         (Database.room_creation_restricted (Some setup_db));
+      check "account update preserves unknown settings" "keep-me"
+        (Database.with_statement setup_db "SELECT settings FROM accounts"
+           (fun statement ->
+             ignore (Sqlite3.step statement);
+             Sqlite3.column_text statement 0 |> Yojson.Safe.from_string
+             |> Yojson.Safe.Util.member "custom_setting"
+             |> Yojson.Safe.Util.to_string));
+      check "account name updates" (Some "Campfire Updated")
+        (Database.account_name (Some setup_db));
+      check "account custom styles save" true
+        (Database.update_account_custom_styles (Some setup_db)
+           ~custom_styles:"body { color: rebeccapurple; }"
+           ~timestamp:"2026-10-07 12:03:58.250");
+      check "account custom styles are read from original column"
+        (Some "body { color: rebeccapurple; }")
+        (Database.account_custom_styles (Some setup_db));
+      check "account settings-only update succeeds" true
+        (Database.update_account (Some setup_db) ~name:None
+           ~restrict_room_creation:(Some false) ~timestamp:"2026-10-07 12:03:58.500");
+      check "account settings-only update leaves name unchanged"
+        (Some "Campfire Updated") (Database.account_name (Some setup_db));
+      check "account settings-only update applies setting" false
+        (Database.room_creation_restricted (Some setup_db));
+      ignore
+        (Database.update_account (Some setup_db) ~name:(Some "Campfire")
+           ~restrict_room_creation:(Some true) ~timestamp:"2026-10-07 12:03:59.000");
       (try
          ignore
            (Database.create_open_room (Some setup_db) ~name:"Forbidden"
@@ -583,33 +792,42 @@ let () =
             Sqlite3.column_int statement 0)
       in
       exec setup_db
-        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('Message',%d,'attachment',1)" delete_id);
-      (try
-         Database.update_message (Some setup_db) ~room_id:1 ~message_id:delete_id
-           ~user_id ~role:1 ~body:"drop attachment" ~timestamp:"2026-10-07 12:41:00.000";
-         failwith "attached message edit unexpectedly succeeded"
-       with Database.Message_has_attachments -> ());
-      check "unsupported attached-message edit is non-destructive" "<div>delete me</div>"
-        (Database.find_message (Some setup_db) 1 delete_id
-        |> Option.get |> fun (message : Database.message) -> message.body_html);
-      (try
-         Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
-           ~user_id ~role:1;
-         failwith "attached message deletion unexpectedly succeeded"
-       with Database.Message_has_attachments -> ());
-      check "unsupported attached-message deletion is non-destructive" true
-        (Database.find_message (Some setup_db) 1 delete_id <> None);
+        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('Message',%d,'attachment',79)" delete_id);
       exec setup_db
-        (Printf.sprintf "DELETE FROM active_storage_attachments WHERE record_id=%d" delete_id);
+        (Printf.sprintf "INSERT INTO active_storage_attachments(record_type,record_id,name,blob_id) VALUES('User',%d,'avatar',79)" user_id);
+      Database.update_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+        ~user_id ~role:1 ~body:"edited with attachment" ~timestamp:"2026-10-07 12:41:00.000";
+      check "attached-message edit updates text while preserving the attachment"
+        ("<div>edited with attachment</div>", 1)
+        ( (Database.find_message (Some setup_db) 1 delete_id
+          |> Option.get |> fun (message : Database.message) -> message.body_html),
+          Database.with_statement setup_db
+            (Printf.sprintf "SELECT count(*) FROM active_storage_attachments WHERE record_type='Message' AND record_id=%d" delete_id)
+            (fun statement ->
+              ignore (Sqlite3.step statement);
+              Sqlite3.column_int statement 0) );
       (try
-         Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
-           ~user_id:2 ~role:0;
+         ignore
+           (Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+              ~user_id:2 ~role:0);
          failwith "non-author message deletion unexpectedly succeeded"
        with Database.Message_not_authorized -> ());
       check "unauthorized delete preserves the message" true
         (Database.find_message (Some setup_db) 1 delete_id <> None);
-      Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
-        ~user_id ~role:1;
+      check "authorized attached-message deletion preserves shared blob"
+        []
+        (Database.delete_message (Some setup_db) ~room_id:1 ~message_id:delete_id
+           ~user_id ~role:1);
+      check "attached-message deletion preserves a blob shared with an avatar" [ 0; 1 ]
+        (List.map
+           (fun sql ->
+             Database.with_statement setup_db sql (fun statement ->
+               ignore (Sqlite3.step statement);
+               Sqlite3.column_int statement 0))
+           [ Printf.sprintf "SELECT count(*) FROM active_storage_attachments WHERE record_type='Message' AND record_id=%d" delete_id;
+             "SELECT count(*) FROM active_storage_blobs WHERE id=79" ]);
+      check "last attachment destruction returns and removes the shared blob"
+        [ "klmnopqrst" ] (Database.destroy_avatar (Some setup_db) user_id);
       check "message deletion removes the row and FTS entry" 0
         (Database.with_statement setup_db
            "SELECT count(*) FROM message_search_index WHERE message_search_index MATCH 'delete'"
@@ -645,7 +863,7 @@ let () =
       check "unauthorized room delete has no effect" true
         (Database.find_room_for_user (Some setup_db) (user_id + 1) deletion_room_id
         <> None);
-      check "shared-room deletion is atomic and cascades indexed content" true
+      check "shared-room deletion is atomic and cascades indexed content" (Some [])
         (Database.delete_room (Some setup_db) ~room_id:deletion_room_id ~user_id
            ~role:1);
       check "room delete removes its message, boost, rich text, and FTS row" [ 0; 0; 0; 0 ]
@@ -680,28 +898,62 @@ let () =
         [ (attached_message_id,
            { Database.message_id = attached_message_id; blob_id = 78;
              key = "ghijklmnop"; filename = "attached.txt";
-             content_type = "text/plain"; byte_size = 3 }) ]
+             content_type = "text/plain"; byte_size = 3; width = None; height = None }) ]
         (Database.attachments_for_messages (Some setup_db)
            (Database.messages_for_room (Some setup_db) attached_room_id));
+      exec setup_db
+        "INSERT INTO active_storage_blobs(id,key,content_type,filename,byte_size,metadata) VALUES(79,'klmnopqrst','image/jpeg','attached.jpg',3,'{\"identified\":true}')";
+      check "Active Storage metadata analyzer updates image dimensions" true
+        (Database.update_blob_dimensions (Some setup_db) ~blob_id:79 ~width:1920 ~height:1080);
+      check "Active Storage dimension update preserves existing analyzer metadata" true
+        (Database.with_statement setup_db
+           "SELECT json_extract(metadata,'$.identified') FROM active_storage_blobs WHERE id=79"
+           (fun statement -> ignore (Sqlite3.step statement); Sqlite3.column_int statement 0 = 1));
+      let dimension_room_id =
+        Database.create_closed_room (Some setup_db) ~name:"Attachment dimensions"
+          ~creator_id:user_id ~member_ids:[] ~timestamp:"2026-10-07 12:43:02.000"
+        |> Option.get
+      in
+      let dimension_message_id =
+        Database.create_message_with_id ~attachment_blob_id:79 (Some setup_db)
+          ~room_id:dimension_room_id ~creator_id:user_id ~body:"photo"
+          ~client_message_id:"attachment-dimensions"
+          ~timestamp:"2026-10-07 12:43:03.000"
+        |> Option.get
+      in
+      let dimension_message =
+        Database.messages_for_room (Some setup_db) dimension_room_id
+        |> List.find (fun (message : Database.message) -> message.Database.id = dimension_message_id)
+      in
+      let dimensions =
+        Database.attachments_for_messages (Some setup_db) [ dimension_message ]
+        |> List.assoc_opt dimension_message_id
+        |> Option.map (fun (attachment : Database.message_attachment) ->
+             (attachment.Database.width, attachment.Database.height))
+      in
+      check "message attachment query reads Active Storage image dimensions"
+        (Some (Some 1920, Some 1080)) dimensions;
+      check "dimension fixture room removes its attached blob"
+        (Some [ "klmnopqrst" ])
+        (Database.delete_room (Some setup_db) ~room_id:dimension_room_id ~user_id ~role:1);
       check "room members can fetch an attached message blob" true
         (Database.authorized_stored_blob (Some setup_db) ~blob_id:78 ~user_id);
       check "non-members cannot fetch an attached message blob" false
         (Database.authorized_stored_blob (Some setup_db) ~blob_id:78 ~user_id:3);
-      (try
-         ignore
-           (Database.delete_room (Some setup_db) ~room_id:attached_room_id
-              ~user_id ~role:1);
-         failwith "attached room deletion unexpectedly succeeded"
-       with Database.Room_has_attachments -> ());
-      check "room with unsupported attachments stays intact" true
-        (Database.find_room_for_user (Some setup_db) user_id attached_room_id <> None
-        && Database.find_message (Some setup_db) attached_room_id attached_message_id <> None);
-      exec setup_db
-        (Printf.sprintf "DELETE FROM active_storage_attachments WHERE record_id=%d" attached_message_id);
-      ignore
+      check "room deletion returns storage key for its unshared attachment"
+        (Some [ "ghijklmnop" ])
         (Database.delete_room (Some setup_db) ~room_id:attached_room_id ~user_id
            ~role:1);
-      check "direct conversation is deletable by any participant" true
+      check "room deletion removes message and orphan attachment rows" [ 0; 0; 0 ]
+        (List.map
+           (fun sql ->
+             Database.with_statement setup_db sql (fun statement ->
+               ignore (Sqlite3.step statement);
+               Sqlite3.column_int statement 0))
+           [ "SELECT count(*) FROM messages WHERE id=" ^ string_of_int attached_message_id;
+             "SELECT count(*) FROM active_storage_attachments WHERE record_id=" ^ string_of_int attached_message_id;
+             "SELECT count(*) FROM active_storage_blobs WHERE id=78" ]);
+      check "direct conversation is deletable by any participant" (Some [])
         (Database.delete_room (Some setup_db) ~room_id:direct_room_id
            ~user_id:(user_id + 1) ~role:0);
       check "direct conversation deletion removes all memberships" []
@@ -779,5 +1031,126 @@ let () =
       check "search results follow Rails chronological order" [ earlier_id; later_id ]
         (Database.search_messages (Some setup_db) user_id "\"orderprobe\""
         |> List.map (fun (result : Database.search_result) ->
-               result.Database.message.Database.id))
+               result.Database.message.Database.id));
+      let old_join_code =
+        Database.with_statement setup_db "SELECT join_code FROM accounts" (fun statement ->
+            ignore (Sqlite3.step statement); Sqlite3.column_text statement 0)
+      in
+      check "account members lists only active users" true
+        (Database.account_members (Some setup_db)
+         |> List.exists (fun (member : Database.account_member) -> member.id = 2)
+         && not (Database.account_members (Some setup_db)
+                 |> List.exists (fun (member : Database.account_member) -> member.id = 3)));
+      check "join code rotates" true
+        (match Database.rotate_join_code (Some setup_db) with
+         | Some code -> code <> old_join_code && Database.valid_join_code (Some setup_db) code
+         | None -> false);
+      exec setup_db
+        "INSERT INTO users(id,name,email_address,role,status,created_at,updated_at) VALUES(4,'Deactivation target','deactivate@example.com',0,0,'2026-10-07','2026-10-07'); INSERT INTO rooms(id,name,type,creator_id,created_at,updated_at) VALUES(99,'Direct fixture','Rooms::Direct',1,'2026-10-07','2026-10-07'); INSERT INTO memberships(room_id,user_id,created_at,updated_at) VALUES(1,4,'2026-10-07','2026-10-07'),(99,4,'2026-10-07','2026-10-07'); INSERT INTO sessions(user_id,token,user_agent,ip_address,last_active_at,created_at,updated_at) VALUES(4,'deactivation-session','test','127.0.0.1','2026-10-07','2026-10-07','2026-10-07'); INSERT INTO searches(user_id,query,created_at,updated_at) VALUES(4,'private query','2026-10-07','2026-10-07'); INSERT INTO push_subscriptions(user_id,endpoint,created_at,updated_at) VALUES(4,'https://push.invalid/4','2026-10-07','2026-10-07')";
+      check "account member role can be promoted" true
+        (Database.update_member_role (Some setup_db) ~user_id:4 ~role:1
+           ~timestamp:"2026-10-07 12:54:00.000");
+      check "account member role persists" 1
+        (Database.with_statement setup_db "SELECT role FROM users WHERE id=4" (fun statement ->
+             ignore (Sqlite3.step statement); Sqlite3.column_int statement 0));
+      check "account member role can be restored" true
+        (Database.update_member_role (Some setup_db) ~user_id:4 ~role:0
+           ~timestamp:"2026-10-07 12:54:01.000");
+      check "member deactivation succeeds" true
+        (Database.deactivate_member (Some setup_db) ~user_id:4
+           ~timestamp:"2026-10-07 12:54:02.000");
+      check "deactivation anonymizes email and marks inactive" true
+        (Database.with_statement setup_db "SELECT status=1 AND email_address LIKE '%-deactivated-%' FROM users WHERE id=4" (fun statement ->
+             ignore (Sqlite3.step statement); Sqlite3.column_int statement 0 = 1));
+      check "deactivation removes shared membership" 0
+        (Database.with_statement setup_db "SELECT count(*) FROM memberships WHERE user_id=4 AND room_id=1" (fun statement ->
+             ignore (Sqlite3.step statement); Sqlite3.column_int statement 0));
+      check "deactivation preserves direct membership" 1
+        (Database.with_statement setup_db "SELECT count(*) FROM memberships WHERE user_id=4 AND room_id=99" (fun statement ->
+             ignore (Sqlite3.step statement); Sqlite3.column_int statement 0));
+      check "deactivation removes sessions, searches and push subscriptions" [0; 0; 0]
+        (List.map (fun table -> Database.with_statement setup_db ("SELECT count(*) FROM " ^ table ^ " WHERE user_id=4") (fun statement ->
+           ignore (Sqlite3.step statement); Sqlite3.column_int statement 0)) ["sessions"; "searches"; "push_subscriptions"]);
+      check "deactivated member no longer authenticates" None
+        (Database.find_session_identity (Some setup_db) "deactivation-session");
+      check "active user lookup finds only active users" true
+        (Database.find_active_user_by_id (Some setup_db) user_id <> None
+         && Database.find_active_user_by_id (Some setup_db) 4 = None);
+      exec setup_db
+        "INSERT INTO users(id,name,email_address,role,status,created_at,updated_at) VALUES(5,'Ban target','ban@example.com',0,0,'2026-10-07','2026-10-07'); INSERT INTO memberships(room_id,user_id,created_at,updated_at) VALUES(1,5,'2026-10-07','2026-10-07'); INSERT INTO sessions(user_id,token,ip_address,last_active_at,created_at,updated_at) VALUES(5,'ban-session-1','203.0.113.1','2026-10-07','2026-10-07','2026-10-07'),(5,'ban-session-2','203.0.113.1','2026-10-07','2026-10-07','2026-10-07'),(5,'ban-session-private','127.0.0.1','2026-10-07','2026-10-07','2026-10-07')";
+      let banned_blob_id =
+        Database.create_stored_blob (Some setup_db) ~key:"bannedblob123"
+          ~filename:"banned.txt" ~content_type:"text/plain" ~byte_size:4
+          ~checksum:"AAAAAA==" ~metadata:"{}" ~timestamp:"2026-10-07 12:54:59.000"
+        |> Option.get
+      in
+      let banned_message_id =
+        Database.create_message_with_id ~attachment_blob_id:banned_blob_id
+          (Some setup_db) ~room_id:1 ~creator_id:5
+          ~body:"message removed with banned user" ~client_message_id:"banned-message"
+          ~timestamp:"2026-10-07 12:55:00.000" |> Option.get
+      in
+      check "banning an active user succeeds" true
+        (Database.ban_user (Some setup_db) ~user_id:5
+           ~timestamp:"2026-10-07 12:55:01.000");
+      check "ban changes Rails status and revokes all sessions" [2; 0]
+        (Database.with_statement setup_db
+           "SELECT status,(SELECT count(*) FROM sessions WHERE user_id=5) FROM users WHERE id=5"
+           (fun statement -> ignore (Sqlite3.step statement);
+             [Sqlite3.column_int statement 0; Sqlite3.column_int statement 1]));
+      check "ban stores unique public session IPs only" ["203.0.113.1"]
+        (Database.with_statement setup_db "SELECT ip_address FROM bans WHERE user_id=5 ORDER BY ip_address"
+           (fun statement -> let rec collect values = match Sqlite3.step statement with
+             | Sqlite3.Rc.ROW -> collect (Sqlite3.column_text statement 0 :: values)
+             | Sqlite3.Rc.DONE -> List.rev values | error -> failwith (Sqlite3.Rc.to_string error)
+             in collect []));
+      check "banned user is excluded from active-user authentication" None
+        (Database.find_active_user_by_id (Some setup_db) 5);
+      let removed_messages, removed_files =
+        Database.delete_banned_user_messages (Some setup_db) ~user_id:5
+      in
+      check "ban cleanup reports deleted messages for Cable" [banned_message_id]
+        (List.map (fun (message : Database.banned_message) -> message.message_id) removed_messages);
+      check "ban cleanup purges orphan attachment bytes" ["bannedblob123"] removed_files;
+      check "ban cleanup removes orphan blob row" 0
+        (Database.with_statement setup_db "SELECT count(*) FROM active_storage_blobs WHERE id=?"
+           (fun statement -> ignore (Sqlite3.bind_int statement 1 banned_blob_id);
+             ignore (Sqlite3.step statement); Sqlite3.column_int statement 0));
+      check "ban cleanup deletes message and search row" [0; 0]
+        (Database.with_statement setup_db
+           "SELECT (SELECT count(*) FROM messages WHERE id=?),(SELECT count(*) FROM message_search_index WHERE rowid=?)"
+           (fun statement -> ignore (Sqlite3.bind_int statement 1 banned_message_id);
+             ignore (Sqlite3.bind_int statement 2 banned_message_id); ignore (Sqlite3.step statement);
+             [Sqlite3.column_int statement 0; Sqlite3.column_int statement 1]));
+      check "unbanning restores active status and removes IP bans" true
+        (Database.unban_user (Some setup_db) ~user_id:5
+           ~timestamp:"2026-10-07 12:55:02.000"
+         && Database.find_active_user_by_id (Some setup_db) 5 <> None
+         && Database.with_statement setup_db "SELECT count(*) FROM bans WHERE user_id=5"
+              (fun statement -> ignore (Sqlite3.step statement); Sqlite3.column_int statement 0 = 0));
+      let mention_secret = "Rails Action Text mention fixture secret" in
+      let mention_sgid =
+        Rails_crypto.sign_attachable_sgid ~secret:mention_secret ~model:"User" user_id
+      in
+      let mention_message_id =
+        Database.create_message_with_id ~secret:mention_secret (Some setup_db)
+          ~room_id:1 ~creator_id:user_id
+          ~body:("<div>Hey <action-text-attachment sgid=\"" ^ mention_sgid
+                 ^ "\" content-type=\"application/vnd.campfire.mention\"></action-text-attachment></div>")
+          ~client_message_id:"verified-mention-attachment"
+          ~timestamp:"2026-10-07 12:56:00.000"
+        |> Option.get
+      in
+      let mention_body =
+        Database.with_statement setup_db
+          "SELECT body FROM action_text_rich_texts WHERE record_type='Message' AND record_id=? AND name='body'"
+          (fun statement ->
+            ignore (Sqlite3.bind_int statement 1 mention_message_id);
+            ignore (Sqlite3.step statement);
+            Sqlite3.column_text statement 0)
+      in
+      check "verified Action Text User mention persists in the Rails rich-text row" true
+        (String.starts_with ~prefix:"<div>Hey <action-text-attachment sgid=\"" mention_body);
+      check "persisted mention resolves back to its Rails User GlobalID" [ user_id ]
+        (Action_text.mentioned_user_ids ~secret:mention_secret mention_body)
     )
