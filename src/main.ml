@@ -541,8 +541,16 @@ let create_message_id () =
   ^ String.sub hex 12 4 ^ "-" ^ String.sub hex 16 4 ^ "-"
   ^ String.sub hex 20 12
 
+type queued_message_push = {
+  push_title : string;
+  push_body : string;
+  push_path : string;
+  push_badge : int;
+  push_target : Database.message_push_target;
+}
+
 let dispatch_message_push =
-  ref (fun ~sw:_ ~process_mgr:_ ~database:_ ~database_lock:_ ~secret:_ ~room:_
+  ref (fun ~push_queue:_ ~process_mgr:_ ~database:_ ~database_lock:_ ~secret:_ ~room:_
          ~creator_id:_ ~body:_ ~message:_ ~timestamp:_ -> ())
 
 let iso8601_millis timestamp =
@@ -574,7 +582,7 @@ let bot_message_json ~secret ~database ?attachment_filename room_id (message : D
       ("room", `Assoc [ ("id", `Int room_id) ]);
       ("url", `String (Printf.sprintf "/rooms/%d/messages/%d" room_id message.Database.id)) ]
 
-let bot_messages_request ~sw ~process_mgr ~database_lock ~store_upload ~cleanup_upload ~remove_file message_bus database secret
+let bot_messages_request ~push_queue ~process_mgr ~database_lock ~store_upload ~cleanup_upload ~remove_file message_bus database secret
     request body room_id bot_key message_id =
   match Database.authenticate_bot database (String.trim bot_key) with
   | None -> response `Unauthorized "Authentication required"
@@ -661,7 +669,7 @@ let bot_messages_request ~sw ~process_mgr ~database_lock ~store_upload ~cleanup_
                        (match find_message message_id with
                        | None -> response `Internal_server_error "Message not found"
                        | Some message ->
-                           !dispatch_message_push ~sw ~process_mgr ~database ~database_lock
+                           !dispatch_message_push ~push_queue ~process_mgr ~database ~database_lock
                              ~secret ~room ~creator_id:bot.Database.id ~body:message_body
                              ~message ~timestamp:message.Database.created_at;
                            publish_message false message;
@@ -1938,7 +1946,7 @@ let update_blob_dimensions_from_disk ?process_mgr database blob_id =
                   (Database.update_blob_dimensions database ~blob_id ~width ~height)))
   with _ -> ()
 
-let submit_message ~sw ~process_mgr ~database_lock message_bus database secret headers room_id body =
+let submit_message ~push_queue ~process_mgr ~database_lock message_bus database secret headers room_id body =
   let request_headers = headers in
   let session = load_session secret headers in
   let form, files = parse_request_form headers body in
@@ -2026,7 +2034,7 @@ let submit_message ~sw ~process_mgr ~database_lock message_bus database secret h
                     let message = Database.find_message database room_id message_id in
                     Option.iter
                       (fun message ->
-                        !dispatch_message_push ~sw ~process_mgr ~database ~database_lock
+                        !dispatch_message_push ~push_queue ~process_mgr ~database ~database_lock
                           ~secret ~room ~creator_id:identity.Database.user.id ~body:content
                           ~message ~timestamp:message.Database.created_at)
                       message;
@@ -3411,7 +3419,7 @@ let deliver_test_push ?(title = "Campfire Test") ?body:notification_body
 
 let () =
   dispatch_message_push :=
-    (fun ~sw ~process_mgr ~database ~database_lock ~secret ~room ~creator_id ~body
+    (fun ~push_queue ~process_mgr:_ ~database ~database_lock:_ ~secret ~room ~creator_id ~body
          ~message ~timestamp ->
       let mentioned_user_ids = Action_text.mentioned_user_ids ~secret body in
       let targets =
@@ -3440,20 +3448,28 @@ let () =
           let badge =
             Database.unread_membership_count database ~user_id:target.Database.user_id
           in
-          Eio.Fiber.fork ~sw (fun () ->
-              match
-                deliver_test_push ~title ~body:notification_body
-                  ~path:("/rooms/" ^ string_of_int room.Database.id) ~badge
-                  process_mgr database target.Database.user_id target.Database.subscription
-              with
-              | `Expired _ ->
-                  Eio.Mutex.use_rw ~protect:true database_lock (fun () ->
-                      ignore
-                        (Database.delete_push_subscription database
-                           ~user_id:target.Database.user_id
-                           ~subscription_id:target.Database.subscription.Database.id))
-              | _ -> ()))
+          Eio.Stream.add push_queue
+            { push_title = title;
+              push_body = notification_body;
+              push_path = "/rooms/" ^ string_of_int room.Database.id;
+              push_badge = badge;
+              push_target = target })
         targets)
+
+let deliver_queued_message_push ~process_mgr ~database ~database_lock task =
+  let target = task.push_target in
+  match
+    deliver_test_push ~title:task.push_title ~body:task.push_body
+      ~path:task.push_path ~badge:task.push_badge process_mgr database
+      target.Database.user_id target.Database.subscription
+  with
+  | `Expired _ ->
+      Eio.Mutex.use_rw ~protect:true database_lock (fun () ->
+          ignore
+            (Database.delete_push_subscription database
+               ~user_id:target.Database.user_id
+               ~subscription_id:target.Database.subscription.Database.id))
+  | _ -> ()
 
 let test_push_notification_request process_mgr database secret headers request
     subscription_id body =
@@ -4432,7 +4448,7 @@ let create_boost_request database secret headers message_id body =
                     else redirect path
               with _ -> response `Unprocessable_entity "Boost could not be saved")
 
-let serve_request ~sw ~database_lock ~process_mgr ~database ~jobs_database ~message_bus ~remote_ip request body =
+let serve_request ~sw ~push_queue ~database_lock ~process_mgr ~database ~jobs_database ~message_bus ~remote_ip request body =
   let path = path_of_request request in
   let headers = Cohttp.Request.headers request in
   match (Cohttp.Request.meth request, path) with
@@ -5035,7 +5051,7 @@ let serve_request ~sw ~database_lock ~process_mgr ~database ~jobs_database ~mess
     when bot_messages_route_of_path bot_path <> None ->
       (match (secret_key_base (), bot_messages_route_of_path bot_path) with
       | Some secret, Some (room_id, bot_key, message_id) ->
-          bot_messages_request ~sw ~process_mgr
+          bot_messages_request ~push_queue ~process_mgr
             ~database_lock
             ~store_upload:(store_upload ~process_mgr database)
             ~cleanup_upload:(cleanup_uploaded_blob database)
@@ -5144,7 +5160,7 @@ let serve_request ~sw ~database_lock ~process_mgr ~database ~jobs_database ~mess
       | Some secret, Some room_id ->
           (try
              let request_body = request_body ~max_size:54_525_952 body in
-             submit_message ~sw ~process_mgr ~database_lock message_bus database secret
+             submit_message ~push_queue ~process_mgr ~database_lock message_bus database secret
                headers room_id request_body
            with
           | Request_body_too_large ->
@@ -5631,7 +5647,21 @@ let serve ~database ~jobs_database ~port ~domains ~bind_address =
   Eio_main.run (fun env ->
       let message_bus = Cable_bus.create () in
       let database_lock = Eio.Mutex.create () in
+      let push_queue = Eio.Stream.create max_int in
       Eio.Switch.run (fun sw ->
+          for _ = 1 to domains do
+            Eio.Fiber.fork ~sw (fun () ->
+                let rec worker () =
+                  let task = Eio.Stream.take push_queue in
+                  (try
+                     deliver_queued_message_push
+                       ~process_mgr:(Eio.Stdenv.process_mgr env) ~database
+                       ~database_lock task
+                   with error -> prerr_endline (Printexc.to_string error));
+                  worker ()
+                in
+                worker ());
+          done;
           let server =
             Cohttp_eio.Server.make_response_action
               ~callback:(fun connection request body ->
@@ -5644,7 +5674,7 @@ let serve ~database ~jobs_database ~port ~domains ~bind_address =
                 else
                   let respond () =
                     `Response
-                      (serve_request ~sw ~database_lock
+                      (serve_request ~sw ~push_queue ~database_lock
                          ~process_mgr:(Eio.Stdenv.process_mgr env)
                          ~database ~jobs_database ~message_bus
                          ~remote_ip:(remote_ip connection) request body)
