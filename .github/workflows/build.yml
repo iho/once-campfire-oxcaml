@@ -14,7 +14,6 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    container: debian:trixie-slim
     env:
       OPAMROOT: ${{ github.workspace }}/.opam-root
     steps:
@@ -30,8 +29,8 @@ jobs:
             opam-${{ runner.os }}-debian-trixie-5.2.0+ox-
       - name: Install system prerequisites
         run: |
-          apt-get update
-          apt-get install -y autoconf build-essential ca-certificates git gzip libsqlite3-dev libssl-dev nodejs opam pkg-config rsync zlib1g-dev
+          sudo apt-get update
+          sudo apt-get install -y autoconf build-essential ca-certificates git gzip libsqlite3-dev libssl-dev nodejs opam pkg-config rsync zlib1g-dev
       - name: Install OxCaml
         run: |
           opam init --disable-sandboxing --bare --yes
