@@ -57,12 +57,13 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build production image and run native tests
         run: docker build --tag once-campfire-oxcaml:test .
-      - name: Smoke-test production image
+      - name: Smoke-test four-domain production image
         run: |
           docker run --detach --rm --name once-campfire-oxcaml-ci \
             --publish 127.0.0.1:18080:80 \
             --tmpfs /rails/storage:mode=1777 \
             --env SECRET_KEY_BASE=ci-only-not-a-real-secret \
+            --env WEB_WORKERS=4 \
             once-campfire-oxcaml:test
           trap 'docker stop once-campfire-oxcaml-ci >/dev/null 2>&1 || true' EXIT
           for attempt in $(seq 1 30); do
@@ -75,6 +76,8 @@ jobs:
             docker logs once-campfire-oxcaml-ci
             exit 1
           fi
+          seq 1 32 | xargs -P 8 -I {} curl --fail --silent --output /dev/null \
+            http://127.0.0.1:18080/up
           curl --fail --silent --show-error --compressed --dump-header /tmp/oxcaml-css-headers \
             -H 'Accept-Encoding: gzip' http://127.0.0.1:18080/assets/campfire.css \
             --output /tmp/oxcaml-campfire.css
