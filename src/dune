@@ -76,6 +76,11 @@
  (libraries campfire_oxcaml_core))
 
 (test
+ (name key_cache_test)
+ (modules key_cache_test)
+ (libraries campfire_oxcaml_core))
+
+(test
  (name session_test)
  (modules session_test)
  (libraries campfire_oxcaml_core))

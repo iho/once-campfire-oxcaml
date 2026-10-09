@@ -201,6 +201,16 @@ measured.
 Run the native SQLite, bcrypt and Rails cookie/CSRF checks with
 `opam exec --switch=5.2.0+ox -- dune runtest --profile=release`.
 
+## Performance work
+
+Rails-derived cryptographic keys are cached per domain, bounded to 16 entries for
+the most recently used installation secret. PBKDF2 parameters, token formats and
+per-token HMAC/GCM verification are unchanged; no authenticated responses are cached.
+A five-round release microbenchmark on macOS ARM64 improved from 1,281 to 32,661
+operations/second (25.5×) for cookie verification/decryption plus stream signing.
+This is not an HTTP result and does not establish that this app is faster than Rust
+or Go. See [measurement and reproduction notes](bench/README.md).
+
 ## Compatibility status
 
 No full Rails compatibility or production-readiness claim is made yet. The authenticated

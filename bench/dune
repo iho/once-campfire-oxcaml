@@ -1,0 +1,3 @@
+(executable
+ (name crypto)
+ (libraries campfire_oxcaml_core unix yojson))

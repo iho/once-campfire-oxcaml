@@ -134,7 +134,34 @@ let json_encode value =
     json;
   Buffer.contents output
 
-let derive_key secret salt length = pbkdf2_sha256 secret salt 1000 length
+type derived_key_cache = {
+  secret : string;
+  keys : (string * int * string) list;
+}
+
+(* Each domain retains keys for only its most recently used installation secret.
+   PBKDF2 parameters and key bytes are unchanged; HMAC/GCM verification still runs
+   for every token. Domain-local storage avoids a shared lock on every request. *)
+let derived_keys : derived_key_cache option Domain.Safe.DLS.key =
+  Domain.Safe.DLS.new_key (fun () -> None)
+
+let derive_key secret salt length =
+  let keys =
+    match Domain.Safe.DLS.get derived_keys with
+    | Some cache when cache.secret = secret -> cache.keys
+    | _ -> []
+  in
+  match List.find_opt (fun (s, size, _) -> s = salt && size = length) keys with
+  | Some (_, _, key) -> key
+  | None ->
+      let key = pbkdf2_sha256 secret salt 1000 length in
+      (* Normal callers use a handful of constant salts and 32/64-byte keys.
+         Bound both entry count and retained bytes for any other callers. *)
+      if String.length secret <= 1024 && String.length salt <= 128 && length <= 64 then (
+        let keys = if List.length keys >= 16 then [] else keys in
+        Domain.Safe.DLS.set derived_keys (Some { secret; keys = (salt, length, key) :: keys }))
+      else Domain.Safe.DLS.set derived_keys None;
+      key
 
 let hex input =
   let output = Bytes.create (String.length input * 2) in
