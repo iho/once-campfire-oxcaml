@@ -1,4 +1,43 @@
-# Cryptography microbenchmark
+# Performance measurements
+
+## Rust head-to-head
+
+The manually dispatched **Rust head-to-head** workflow builds both production
+images from pinned sources and generates a fresh canonical Rails fixture using
+the pinned shared verification repository. Four rounds alternate OxCaml/Rust and
+Rust/OxCaml, restoring the same database and files for every application/round.
+Both servers receive CPUs 0–1; the unchanged shared Rust load generator runs on
+CPUs 2–3. Both keep their non-root image users and obtain group access only to the
+disposable storage tree. No SQLite durability pragma is weakened.
+
+Each of room, message-page, sidebar, search and POST workloads uses 16 clients,
+a two-second warmup and an eight-second sample. The upstream route contracts
+validate every response, and every acknowledged write is checked for its exact
+ID, room, body and search-index entry. Failed preflight, partial rounds or failed
+audits cannot produce a successful summary. Read caches use each app's defaults;
+this compares implementations, not language runtimes in isolation.
+
+Run on an otherwise idle Linux host after building the images and shared fixture:
+
+```sh
+ruby bench/comparison_test.rb
+ruby bench/compare.rb --verification /path/to/once-campfire-verification \
+  --seed /path/to/once-campfire-verification/fixtures/default \
+  --rust-image campfire-rust:comparison --oxcaml-image campfire-oxcaml:comparison \
+  --cpus 0-1 --client-cpus 2-3 --rounds 4 --duration 8 --concurrency 16
+```
+
+The output directory must not already exist. Raw samples, write receipts, image
+identities, fixture hash and logs go to ignored `tmp/head-to-head`; disposable
+databases stay under ignored `tmp/runtime`. No credentials are written to the
+result metadata. CI uploads only the results, not fixture credentials/databases.
+GitHub-hosted runners provide useful same-run comparisons, not a substitute for
+repeated measurements on a dedicated performance host. The workflow is not itself
+evidence that OxCaml beats Rust: it must finish successfully before interpreting
+its per-route medians. Mixed-write cache-churn and Cable throughput are not covered
+by this new head-to-head runner.
+
+## Cryptography microbenchmark
 
 Run from the repository root using a release build:
 

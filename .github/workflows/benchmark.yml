@@ -1,0 +1,73 @@
+name: Rust head-to-head
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-head-to-head
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: actions/checkout@v5
+        with:
+          repository: basecamp/once-campfire-rust
+          ref: 9872c1d9541551c0889a60e3d49a14488bd1e403
+          submodules: true
+          path: tmp/rust
+      - uses: actions/checkout@v5
+        with:
+          repository: basecamp/once-campfire-verification
+          ref: e2440515d9093b8304da3d7662d8526f3234b047
+          path: tmp/verification
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install benchmark prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 ffmpeg
+          gem install minitest --no-document
+      - name: Test comparison accounting
+        run: |
+          ruby bench/comparison_test.rb
+          ruby -c bench/compare.rb
+          ruby tmp/verification/bench/test_contracts.rb
+          ruby tmp/verification/bench/test_validate_acks.rb
+          ruby tmp/verification/bench/test_check_sample.rb
+      - name: Build shared load generator
+        run: cargo build --release --locked --manifest-path tmp/verification/loadgen/Cargo.toml
+      - name: Build canonical Rails fixture
+        run: ruby tmp/verification/bin/seed
+      - name: Build OxCaml production image and release tests
+        run: >-
+          docker build --tag campfire-oxcaml:comparison
+          --label org.opencontainers.image.revision=${{ github.sha }} .
+      - name: Build pinned Rust production image
+        run: >-
+          docker build --tag campfire-rust:comparison
+          --build-arg GIT_REVISION=9872c1d9541551c0889a60e3d49a14488bd1e403
+          --label org.opencontainers.image.revision=9872c1d9541551c0889a60e3d49a14488bd1e403
+          tmp/rust
+      - name: Compare validated reads and durable writes
+        run: >-
+          ruby bench/compare.rb --verification tmp/verification
+          --seed tmp/verification/fixtures/default --rounds 4 --duration 8
+          --concurrency 16 --cpus 0-1 --client-cpus 2-3
+          --output tmp/head-to-head
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-head-to-head-results
+          path: tmp/head-to-head/
+          if-no-files-found: ignore

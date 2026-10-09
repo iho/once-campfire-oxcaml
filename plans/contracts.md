@@ -220,3 +220,16 @@ The shared runner's Docker child process and host load-generator connections rem
 blocked, so full canonical-seed preflight and a same-host Rust comparison are still
 pending. SQLite durability, schema and response semantics were not changed to obtain
 the microbenchmark result.
+
+Shared comparison contracts (2026-10-09): the new Linux head-to-head uses the
+unchanged upstream per-response contracts and exact acknowledged-write audit.
+Room HTML, POST Turbo appends, refresh appends and Cable appends now share the
+base-room DOM identity `messages_room_<id>`. This deliberately uses the stable
+base-class spelling accepted by the shared contract, rather than Rails' STI-specific
+`messages_rooms_open_<id>`/closed/direct spelling. It replaces the prior OxCaml-only
+`room_<id>_messages` spelling consistently; existing open pages should be reloaded
+after upgrading. The two-domain production image passed authenticated room, POST
+and refresh checks for this target spelling; SQLite verified the posted rich text,
+search entry and database integrity. Native release tests, the browser-client test,
+the comparison accounting tests and the production build passed. Cable target
+delivery, full comparison and shared canonical-seed verification are pending.

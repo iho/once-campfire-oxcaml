@@ -778,6 +778,8 @@ let bot_boost_request message_bus database secret request body room_id bot_key m
                   else response `Not_found "Boost not found"
               | _ -> response `Method_not_allowed "Method not allowed"))
 
+let message_container_id room_id = "messages_room_" ^ string_of_int room_id
+
 let room_page ~secret ~database (user : Database.user)
     (sidebar : Database.sidebar_room list)
     (current : Database.room) csrf (messages : Database.message list)
@@ -851,8 +853,8 @@ let room_page ~secret ~database (user : Database.user)
        ^ (if current.Database.kind = "Rooms::Direct" then "Delete conversation" else "Delete room")
        ^ "</button></form>"
      else "")
-  ^ "<section aria-label=\"Messages\"><ol id=\"room_"
-  ^ string_of_int current.Database.id ^ "_messages\">"
+  ^ "<section aria-label=\"Messages\"><ol id=\""
+  ^ message_container_id current.Database.id ^ "\">"
   ^ (messages
     |> List.map (fun (message : Database.message) ->
            render_message_item ~secret ~database ~room_name:current.Database.name
@@ -2052,8 +2054,8 @@ let submit_message ~push_queue ~process_mgr ~database_lock message_bus database 
                     if accepts_turbo_stream then
                       let message = Option.get message in
                       let html =
-                        "<turbo-stream action=\"append\" target=\"room_"
-                        ^ string_of_int room_id ^ "_messages\"><template>"
+                        "<turbo-stream action=\"append\" target=\""
+                        ^ message_container_id room_id ^ "\"><template>"
                         ^ render_live_message ~secret ~database
                             ~room_name:room.Database.name ~boosts ~attachments
                             identity.Database.user room_id
@@ -2601,7 +2603,7 @@ let refresh_room_request database secret headers room_id request =
             match created with
             | [] -> ""
             | messages ->
-                stream "append" ("room_" ^ string_of_int room_id ^ "_messages")
+                stream "append" (message_container_id room_id)
                   (messages |> List.map render |> String.concat "")
           in
           let replace =
@@ -5420,8 +5422,8 @@ let cable_websocket env database message_bus database_lock identity secret csrf 
                 identity.Database.user room_id csrf message)
           in
           let html =
-            "<turbo-stream action=\"append\" target=\"room_"
-            ^ string_of_int room_id ^ "_messages\"><template>"
+            "<turbo-stream action=\"append\" target=\""
+            ^ message_container_id room_id ^ "\"><template>"
             ^ rendered_message
             ^ "</template></turbo-stream>"
           in

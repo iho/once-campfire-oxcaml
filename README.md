@@ -210,6 +210,9 @@ A five-round release microbenchmark on macOS ARM64 improved from 1,281 to 32,661
 operations/second (25.5×) for cookie verification/decryption plus stream signing.
 This is not an HTTP result and does not establish that this app is faster than Rust
 or Go. See [measurement and reproduction notes](bench/README.md).
+The manually dispatched **Rust head-to-head** workflow uses pinned Rust and shared
+verification sources, equal Linux CPU allocations and audited writes. A passing
+workflow result is still required before reporting an application-level comparison.
 
 ## Compatibility status
 
